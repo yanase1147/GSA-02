@@ -68,10 +68,29 @@ N_SOBOL = 1024
 PROBLEM = {
     "num_vars": 4,
     "names": ["solar_cost", "wind_cost", "battery_cost", "diesel_marginal_cost"],
-    "bounds": [[35000, 65000], [56000, 104000], [30000, 90000], [60, 140]],
+    # 初期建設費 CAPEX [$/MW] (太陽光/風力/蓄電池) と ディーゼル可変費 [$/MWh]
+    "bounds": [[500000, 900000], [800000, 1450000], [300000, 900000], [200, 300]],
 }
 NAMES = PROBLEM["names"]
 LABELS = ["Solar CAPEX", "Wind CAPEX", "Battery CAPEX", "Diesel fuel cost"]
+
+# 耐用年数 [年] と割引率 (CAPEX の年換算用)
+DISCOUNT_RATE = 0.05
+LIFETIME = {"solar": 25, "wind": 25, "battery": 12, "diesel": 20}
+DIESEL_CAPEX = 800000.0  # ディーゼル初期建設費 [$/MW] (不確実性の対象外, 固定)
+
+
+def crf(rate, lifetime):
+    """資本回収係数 CRF = r(1+r)^n / ((1+r)^n - 1)"""
+    if rate == 0:
+        return 1.0 / lifetime
+    f = (1 + rate) ** lifetime
+    return rate * f / (f - 1)
+
+
+def annualized(capex, tech):
+    """初期建設費 [$/MW] -> 年換算コスト capital_cost [$/MW/year]"""
+    return capex * crf(DISCOUNT_RATE, LIFETIME[tech])
 
 
 # ----------------------------------------------------------------------------
@@ -122,13 +141,13 @@ def build_network():
     n.add("Bus", "bus")
     n.add("Load", "load", bus="bus", p_set=PROFILES["load"])
     n.add("Generator", "solar", bus="bus", carrier="solar", p_nom_extendable=True,
-          p_max_pu=PROFILES["solar"], capital_cost=50000.0, marginal_cost=0.0)
+          p_max_pu=PROFILES["solar"], capital_cost=annualized(700000.0, "solar"), marginal_cost=0.0)
     n.add("Generator", "wind", bus="bus", carrier="wind", p_nom_extendable=True,
-          p_max_pu=PROFILES["wind"], capital_cost=80000.0, marginal_cost=0.0)
+          p_max_pu=PROFILES["wind"], capital_cost=annualized(1100000.0, "wind"), marginal_cost=0.0)
     n.add("Generator", "diesel", bus="bus", carrier="diesel", p_nom_extendable=True,
-          capital_cost=90000.0, marginal_cost=100.0)
+          capital_cost=annualized(DIESEL_CAPEX, "diesel"), marginal_cost=250.0)
     n.add("StorageUnit", "battery", bus="bus", carrier="battery", p_nom_extendable=True,
-          max_hours=4, capital_cost=60000.0, marginal_cost=0.0,
+          max_hours=4, capital_cost=annualized(600000.0, "battery"), marginal_cost=0.0,
           efficiency_store=0.95, efficiency_dispatch=0.95, cyclic_state_of_charge=True)
     return n
 
@@ -136,9 +155,9 @@ def build_network():
 def run_pypsa(params):
     """1サンプル分のLPを解き、総コストと最適容量を返す。"""
     n = build_network()
-    n.generators.loc["solar", "capital_cost"] = params[0]
-    n.generators.loc["wind", "capital_cost"] = params[1]
-    n.storage_units.loc["battery", "capital_cost"] = params[2]
+    n.generators.loc["solar", "capital_cost"] = annualized(params[0], "solar")
+    n.generators.loc["wind", "capital_cost"] = annualized(params[1], "wind")
+    n.storage_units.loc["battery", "capital_cost"] = annualized(params[2], "battery")
     n.generators.loc["diesel", "marginal_cost"] = params[3]
     status, cond = n.optimize(solver_name="highs", log_to_console=False,
                               include_objective_constant=False)
@@ -181,7 +200,7 @@ def main():
     ds = xr.Dataset(
         {c: ("sample", df[c].to_numpy()) for c in df.columns},
         coords={"sample": np.arange(N_LHS)},
-        attrs={"title": "PyPSA LHS 320 results", "units_costs": "USD/MW/year, USD/MWh",
+        attrs={"title": "PyPSA LHS 320 results", "units_costs": "CAPEX USD/MW (overnight), diesel USD/MWh",
                "total_cost_unit": "USD/year", "capacity_unit": "MW"},
     )
     ds.to_netcdf(OUT_DIR / "pypsa_lhs_320_results.nc", engine="netcdf4")
@@ -247,11 +266,15 @@ def main():
     print(cij_df.round(1).to_string())
     cij_df.to_csv(OUT_DIR / "pce_interaction_matrix.csv")
 
-    print("\n--- 技術ペアの関係判定 ---")
+    print("\n--- 技術ペアの関係判定 (総費用最小化: 包絡線定理 dC/dθi = 最適量_i) ---")
+    print("    Cij = d2C/dθi dθj = d(最適量_i)/dθj")
+    print("    Cij < 0: 補完 (θj上昇で両技術の最適容量が同時に減少 / 総費用増を抑制)")
+    print("    Cij > 0: 代替 (θj上昇で技術iへ容量がシフト・置換)")
     for i in range(4):
         for j in range(i + 1, 4):
             c = cij[i, j]
-            tag = "【補完関係 (相乗効果 +)】" if c > 0 else "【代替関係 (競合相殺 -)】" if c < 0 else "【無相互作用】"
+            tag = ("【補完関係 (容量連動・シナジー)】" if c < 0
+                   else "【代替関係 (技術競合・置換)】" if c > 0 else "【無相互作用】")
             print(f"  {NAMES[i]:>21s} x {NAMES[j]:<21s}  Cij = {c:>12,.1f}  {tag}  "
                   f"(Sij = {s2_df.iloc[i, j]:.4f})")
 
