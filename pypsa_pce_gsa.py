@@ -149,11 +149,11 @@ def generate_sample_config(path):
     buses = pd.DataFrame({"bus_name": ["bus"], "v_nom": [0.4]})
     generators = pd.DataFrame([
         {"name": "solar", "bus": "bus", "carrier": "solar", "capex": 700000.0,
-         "marginal_cost": 0.0, "efficiency": 1.0, "lifetime": 25, "p_nom_extendable": True},
+         "marginal_cost": 0.0, "lifetime": 25, "p_nom_extendable": True},
         {"name": "wind", "bus": "bus", "carrier": "wind", "capex": 1100000.0,
-         "marginal_cost": 0.0, "efficiency": 1.0, "lifetime": 25, "p_nom_extendable": True},
+         "marginal_cost": 0.0, "lifetime": 25, "p_nom_extendable": True},
         {"name": "diesel", "bus": "bus", "carrier": "diesel", "capex": 800000.0,
-         "marginal_cost": 250.0, "efficiency": 0.40, "lifetime": 20, "p_nom_extendable": True},
+         "marginal_cost": 250.0, "lifetime": 20, "p_nom_extendable": True},
     ])
     storage_units = pd.DataFrame([
         {"name": "battery", "bus": "bus", "carrier": "battery", "capex": 600000.0,
@@ -382,13 +382,16 @@ def build_network(cfg):
 
     for _, row in cfg["generators"].iterrows():
         name = str(row["name"])
+        # 注: Generatorのefficiencyは(Linkと異なり)PyPSAのLOPFでは使われず
+        # 燃料費/CO2排出換算のロジックもこのスクリプトには無いため、意味を持たない。
+        # 誤解を避けるためGeneratorには渡さない(Link.efficiencyはp1=-p0*efficiencyの
+        # フロー計算に実際に使われるため引き続き渡す)。
         kwargs = dict(
             bus=str(row["bus"]),
             carrier=str(row["carrier"]),
             p_nom_extendable=_to_bool(row["p_nom_extendable"]),
             capital_cost=annualized(float(row["capex"]), float(row["lifetime"])),
             marginal_cost=float(row["marginal_cost"]),
-            efficiency=float(_get_or_default(row, "efficiency", 1.0)),
         )
         pu_col = f"{name}_p_max_pu"  # 命名規則: generators.name + "_p_max_pu"
         if pu_col in ts.columns:
