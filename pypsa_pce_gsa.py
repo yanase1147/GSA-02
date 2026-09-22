@@ -188,6 +188,19 @@ _LINKS_COLUMNS = ["name", "bus0", "bus1", "carrier", "capex", "marginal_cost",
                    "efficiency", "lifetime", "p_nom_extendable"]
 
 
+def _get_or_default(row, col, default):
+    """row.get(col, default) と異なり、列は存在するがセルが空欄(NaN)の場合もdefaultを返す。"""
+    val = row.get(col, default)
+    return default if pd.isna(val) else val
+
+
+def _to_bool(value):
+    """Excel由来の値をboolへ変換する。"FALSE"/"0"等の文字列もFalseとして扱う。"""
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return bool(value)
+
+
 def load_network_config(path):
     if not path.exists():
         generate_sample_config(path)
@@ -326,7 +339,7 @@ def build_network(cfg):
     n.add("Carrier", sorted(carriers))
 
     for _, row in cfg["buses"].iterrows():
-        n.add("Bus", str(row["bus_name"]), v_nom=float(row.get("v_nom", 1.0)))
+        n.add("Bus", str(row["bus_name"]), v_nom=float(_get_or_default(row, "v_nom", 1.0)))
 
     for _, row in cfg["loads"].iterrows():
         name = str(row["name"])
@@ -340,10 +353,10 @@ def build_network(cfg):
         kwargs = dict(
             bus=str(row["bus"]),
             carrier=str(row["carrier"]),
-            p_nom_extendable=bool(row["p_nom_extendable"]),
+            p_nom_extendable=_to_bool(row["p_nom_extendable"]),
             capital_cost=annualized(float(row["capex"]), float(row["lifetime"])),
             marginal_cost=float(row["marginal_cost"]),
-            efficiency=float(row.get("efficiency", 1.0)),
+            efficiency=float(_get_or_default(row, "efficiency", 1.0)),
         )
         pu_col = f"{name}_p_max_pu"  # 命名規則: generators.name + "_p_max_pu"
         if pu_col in ts.columns:
@@ -354,7 +367,7 @@ def build_network(cfg):
         n.add(
             "StorageUnit", str(row["name"]),
             bus=str(row["bus"]), carrier=str(row["carrier"]),
-            p_nom_extendable=bool(row["p_nom_extendable"]),
+            p_nom_extendable=_to_bool(row["p_nom_extendable"]),
             max_hours=float(row["max_hours"]),
             capital_cost=annualized(float(row["capex"]), float(row["lifetime"])),
             efficiency_store=float(row["efficiency_store"]),
@@ -366,11 +379,11 @@ def build_network(cfg):
         n.add(
             "Link", str(row["name"]),
             bus0=str(row["bus0"]), bus1=str(row["bus1"]),
-            carrier=str(row.get("carrier", "")),
-            p_nom_extendable=bool(row["p_nom_extendable"]),
+            carrier=str(_get_or_default(row, "carrier", "")),
+            p_nom_extendable=_to_bool(row["p_nom_extendable"]),
             capital_cost=annualized(float(row["capex"]), float(row["lifetime"])),
-            marginal_cost=float(row.get("marginal_cost", 0.0)),
-            efficiency=float(row.get("efficiency", 1.0)),
+            marginal_cost=float(_get_or_default(row, "marginal_cost", 0.0)),
+            efficiency=float(_get_or_default(row, "efficiency", 1.0)),
         )
     return n
 
@@ -477,7 +490,9 @@ def main():
     res = pd.DataFrame(rows)
     df = pd.concat([pd.DataFrame(X, columns=names), res], axis=1)
     df.index.name = "sample"
-    df.to_csv(os.path.join(output_dir, "pypsa_lhs_320_results.csv"))
+    lhs_csv_name = f"pypsa_lhs_{n_lhs}_results.csv"
+    lhs_nc_name = f"pypsa_lhs_{n_lhs}_results.nc"
+    df.to_csv(os.path.join(output_dir, lhs_csv_name))
 
     ds = xr.Dataset(
         {c: ("sample", df[c].to_numpy()) for c in df.columns},
@@ -488,8 +503,8 @@ def main():
             "total_cost_unit": "USD/year", "capacity_unit": "MW", "energy_unit": "MWh/year",
         },
     )
-    ds.to_netcdf(os.path.join(output_dir, "pypsa_lhs_320_results.nc"), engine="netcdf4")
-    print("    保存: pypsa_lhs_320_results.csv / pypsa_lhs_320_results.nc")
+    ds.to_netcdf(os.path.join(output_dir, lhs_nc_name), engine="netcdf4")
+    print(f"    保存: {lhs_csv_name} / {lhs_nc_name}")
 
     y = df["total_cost"].to_numpy()
 
@@ -595,8 +610,8 @@ def main():
     print("\n" + "=" * 78)
     print(f"完了 ({time.time() - t0:.0f}s)")
     print(f"成果物の保存先: {output_dir}")
-    print("  - pypsa_lhs_320_results.csv")
-    print("  - pypsa_lhs_320_results.nc")
+    print(f"  - {lhs_csv_name}")
+    print(f"  - {lhs_nc_name}")
     print("  - sobol_s2_matrix.csv")
     print("  - pce_interaction_matrix.csv")
     print("  - pypsa_pce_gsa_results.png")
