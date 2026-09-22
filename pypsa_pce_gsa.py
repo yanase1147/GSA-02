@@ -195,10 +195,41 @@ def _get_or_default(row, col, default):
 
 
 def _to_bool(value):
-    """Excel由来の値をboolへ変換する。"FALSE"/"0"等の文字列もFalseとして扱う。"""
+    """Excel由来の値をboolへ変換する。"FALSE"/"0"等の文字列もFalseとして扱う。
+    値がNaN(空欄セル)の場合はここでは判定せず、_validate_required_columns 側で
+    事前にエラーとして検出する前提とする。"""
     if isinstance(value, str):
         return value.strip().lower() in {"true", "1", "yes"}
     return bool(value)
+
+
+_REQUIRED_COLS = {
+    "buses": ["bus_name"],
+    "generators": ["name", "bus", "carrier", "capex", "marginal_cost", "lifetime", "p_nom_extendable"],
+    "storage_units": ["name", "bus", "carrier", "capex", "max_hours",
+                       "efficiency_store", "efficiency_dispatch", "lifetime", "p_nom_extendable"],
+    "loads": ["name", "bus"],
+    "links": ["name", "bus0", "bus1", "capex", "lifetime", "p_nom_extendable"],
+    "uncertainty_params": ["param_name", "component_type", "component_name",
+                            "target_attribute", "lower_bound", "upper_bound"],
+}
+
+
+def _validate_required_columns(df, sheet_name):
+    """sheet_name の必須列について、列の欠落および空欄セル(NaN)を検出しエラーにする。
+    値をfloat()/bool()変換する前にここで弾くことで、空欄がNaNとして
+    サイレントにPyPSAへ渡ってしまう(または真偽値が意図せずTrueになる)事態を防ぐ。"""
+    cols = _REQUIRED_COLS[sheet_name]
+    missing_cols = [c for c in cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"{sheet_name} シートに必須列がありません: {missing_cols}")
+    for col in cols:
+        na_rows = df.index[df[col].isna()]
+        if len(na_rows):
+            excel_rows = [int(i) + 2 for i in na_rows]  # 0-index -> Excel行番号(ヘッダー行+1)
+            raise ValueError(
+                f"{sheet_name}.{col} に空欄セルがあります (Excel行: {excel_rows})"
+            )
 
 
 def load_network_config(path):
@@ -226,6 +257,11 @@ def load_network_config(path):
     else:
         cfg["links"] = pd.DataFrame(columns=_LINKS_COLUMNS)
 
+    for sheet_name in ("buses", "generators", "storage_units", "loads"):
+        _validate_required_columns(cfg[sheet_name], sheet_name)
+    if not cfg["links"].empty:
+        _validate_required_columns(cfg["links"], "links")
+
     cfg["timeseries"]["timestamp"] = pd.to_datetime(cfg["timeseries"]["timestamp"])
     if len(cfg["timeseries"]) != N_HOURS:
         raise ValueError(
@@ -243,11 +279,7 @@ def load_network_config(path):
 
 def _validate_uncertainty_params(cfg):
     udf = cfg["uncertainty_params"]
-    required_cols = {"param_name", "component_type", "component_name",
-                      "target_attribute", "lower_bound", "upper_bound"}
-    missing_cols = required_cols - set(udf.columns)
-    if missing_cols:
-        raise ValueError(f"uncertainty_params シートに列が不足しています: {sorted(missing_cols)}")
+    _validate_required_columns(udf, "uncertainty_params")
     if udf.empty:
         raise ValueError("uncertainty_params シートに行がありません（最低1パラメータが必要です）")
     if udf["param_name"].duplicated().any():
