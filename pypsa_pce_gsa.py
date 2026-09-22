@@ -34,7 +34,9 @@ if missing:
     sys.exit(1)
 
 import logging
+import os
 import time
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -57,7 +59,7 @@ logging.getLogger("pypsa").setLevel(logging.WARNING)
 logging.getLogger("linopy").setLevel(logging.ERROR)
 logging.getLogger("highspy").setLevel(logging.ERROR)
 
-OUT_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent
 SEED = 42
 N_LHS = 320
 N_SOBOL = 1024
@@ -181,6 +183,12 @@ def main():
     print(" LHS(320) -> PyPSA -> PCEサロゲート -> Sobol GSA(10,240)")
     print("=" * 78)
 
+    # --- 出力先ディレクトリ (タイムスタンプ付き) -----------------------------------
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    output_dir = os.path.join(BASE_DIR, "results", timestamp)
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"[0] 出力先フォルダ: {output_dir}")
+
     # --- LHS -----------------------------------------------------------------
     X = latin_sample.sample(PROBLEM, N_LHS, seed=SEED)
     print(f"[1] LHSサンプル生成: {X.shape}  (スナップショット数={len(PROFILES)})")
@@ -195,7 +203,7 @@ def main():
     res = pd.DataFrame(rows)
     df = pd.concat([pd.DataFrame(X, columns=NAMES), res], axis=1)
     df.index.name = "sample"
-    df.to_csv(OUT_DIR / "pypsa_lhs_320_results.csv")
+    df.to_csv(os.path.join(output_dir, "pypsa_lhs_320_results.csv"))
 
     ds = xr.Dataset(
         {c: ("sample", df[c].to_numpy()) for c in df.columns},
@@ -203,7 +211,7 @@ def main():
         attrs={"title": "PyPSA LHS 320 results", "units_costs": "CAPEX USD/MW (overnight), diesel USD/MWh",
                "total_cost_unit": "USD/year", "capacity_unit": "MW"},
     )
-    ds.to_netcdf(OUT_DIR / "pypsa_lhs_320_results.nc", engine="netcdf4")
+    ds.to_netcdf(os.path.join(output_dir, "pypsa_lhs_320_results.nc"), engine="netcdf4")
     print("    保存: pypsa_lhs_320_results.csv / pypsa_lhs_320_results.nc")
 
     y = df["total_cost"].to_numpy()
@@ -246,7 +254,7 @@ def main():
     s2_df = pd.DataFrame(s2, index=NAMES, columns=NAMES)
     print("\n--- Sobol 2次感度指標 (Sij) マトリクス (対角=0) ---")
     print(s2_df.round(4).to_string())
-    s2_df.to_csv(OUT_DIR / "sobol_s2_matrix.csv")
+    s2_df.to_csv(os.path.join(output_dir, "sobol_s2_matrix.csv"))
 
     # --- Cij -------------------------------------------------------------------
     poly = pce.named_steps["poly"]
@@ -264,7 +272,7 @@ def main():
     print("\n--- PCE交差項係数 (Cij) マトリクス [標準化入力空間, 単位: USD/year] "
           "(対角=2乗項Cii) ---")
     print(cij_df.round(1).to_string())
-    cij_df.to_csv(OUT_DIR / "pce_interaction_matrix.csv")
+    cij_df.to_csv(os.path.join(output_dir, "pce_interaction_matrix.csv"))
 
     print("\n--- 技術ペアの関係判定 (総費用最小化: 包絡線定理 dC/dθi = 最適量_i) ---")
     print("    Cij = d2C/dθi dθj = d(最適量_i)/dθj")
@@ -304,11 +312,18 @@ def main():
     ax.legend(loc="lower right")
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig(OUT_DIR / "pypsa_pce_gsa_results.png", dpi=200)
+    fig.savefig(os.path.join(output_dir, "pypsa_pce_gsa_results.png"), dpi=200)
     plt.close(fig)
 
-    print(f"\n完了 ({time.time() - t0:.0f}s). 出力: pypsa_lhs_320_results.csv/.nc, "
-          "sobol_s2_matrix.csv, pce_interaction_matrix.csv, pypsa_pce_gsa_results.png")
+    print("\n" + "=" * 78)
+    print(f"完了 ({time.time() - t0:.0f}s)")
+    print(f"成果物の保存先: {output_dir}")
+    print("  - pypsa_lhs_320_results.csv")
+    print("  - pypsa_lhs_320_results.nc")
+    print("  - sobol_s2_matrix.csv")
+    print("  - pce_interaction_matrix.csv")
+    print("  - pypsa_pce_gsa_results.png")
+    print("=" * 78)
 
 
 if __name__ == "__main__":
