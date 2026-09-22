@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile check
+        run: python -m py_compile pypsa_pce_gsa.py
+
+      # network_config.xlsx はリポジトリに同梱済みのものを使用し、
+      # フル実行(320 LHS点 x 8760h)は重すぎるため縮小実行でエンドツーエンドの
+      # 動作(Excel読込 -> PyPSA最適化 -> PCE -> Sobol -> 出力ファイル生成)を検証する。
+      # RidgeCV/KFoldがcv=10で固定のため、--n-lhsは10以上を指定する必要がある。
+      - name: Reduced end-to-end run (smoke test)
+        run: python pypsa_pce_gsa.py --n-lhs 16 --n-sobol 16
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gsa-results
+          path: results/
+          if-no-files-found: ignore
