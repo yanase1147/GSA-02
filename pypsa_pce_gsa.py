@@ -3,6 +3,10 @@
 Excel(network_config.xlsx) -> LHS(320点) -> PyPSA(8760h) -> PCEサロゲート
                             -> サロゲート上GSA(10,240点) -> Sobol / Cij 解析
 
+不確実性パラメータ(固定費/可変費、任意の電源)は network_config.xlsx の
+uncertainty_params シートで定義する。電源(generators/storage_units/links)も
+Excelに行を追加するだけでコード変更なしに反映される。
+
 実行:  python pypsa_pce_gsa.py
        python pypsa_pce_gsa.py --n-lhs 8 --n-sobol 16   (動作確認用の縮小実行)
 """
@@ -77,20 +81,11 @@ SEED = 42
 N_LHS = 320
 N_SOBOL = 1024
 N_HOURS = 8760
+DISCOUNT_RATE = 0.05  # 割引率 (CAPEXの年換算 CRF 計算用, 全電源共通)
 
-# ----------------------------------------------------------------------------
-# 1. 不確実性パラメータ (LHS/Sobolで振る4つのコストパラメータ)
-# ----------------------------------------------------------------------------
-PROBLEM = {
-    "num_vars": 4,
-    "names": ["solar_cost", "wind_cost", "battery_cost", "diesel_marginal_cost"],
-    # 初期建設費 CAPEX [$/MW] (太陽光/風力/蓄電池) と ディーゼル可変費 [$/MWh]
-    "bounds": [[500000, 900000], [800000, 1450000], [300000, 900000], [200, 300]],
-}
-NAMES = PROBLEM["names"]
-LABELS = ["Solar CAPEX", "Wind CAPEX", "Battery CAPEX", "Diesel fuel cost"]
-
-DISCOUNT_RATE = 0.05  # 割引率 (CAPEXの年換算 CRF 計算用)
+# component_type(uncertainty_params) -> PyPSA Network属性名
+COMPONENT_ATTR = {"generator": "generators", "storage_unit": "storage_units", "link": "links"}
+VALID_TARGET_ATTRS = {"capital_cost", "marginal_cost"}
 
 
 def crf(rate, lifetime):
@@ -102,12 +97,12 @@ def crf(rate, lifetime):
 
 
 def annualized(capex, lifetime, rate=DISCOUNT_RATE):
-    """初期建設費 [$/MW] -> 年換算コスト capital_cost [$/MW/year]"""
+    """初期建設費 [$/MW] -> 年換算固定費 capital_cost [$/MW/year]"""
     return capex * crf(rate, lifetime)
 
 
 # ----------------------------------------------------------------------------
-# 2. network_config.xlsx の読み込み / 自動生成
+# 1. network_config.xlsx の読み込み / 自動生成
 # ----------------------------------------------------------------------------
 def _build_synthetic_timeseries():
     """決定論的な8760時間(1年・1時間刻み)の合成プロファイルを生成する。"""
@@ -142,9 +137,9 @@ def _build_synthetic_timeseries():
 
     return pd.DataFrame({
         "timestamp": idx,
-        "solar_p_max_pu": solar,
+        "solar_p_max_pu": solar,   # 列名は generators.name + "_p_max_pu" の命名規則
         "wind_p_max_pu": wind,
-        "load_mw": load,
+        "load_mw": load,           # 列名は loads.name + "_mw" の命名規則
     })
 
 
@@ -166,6 +161,18 @@ def generate_sample_config(path):
          "lifetime": 12, "p_nom_extendable": True},
     ])
     loads = pd.DataFrame([{"name": "load", "bus": "bus"}])
+    # 任意の電源の CAPEX(capital_cost)/OPEX(marginal_cost)を不確実性パラメータとして登録。
+    # 行を追加/削除するだけでLHS/Sobol/PCEの次元数が自動追従する。
+    uncertainty_params = pd.DataFrame([
+        {"param_name": "solar_capex", "component_type": "generator", "component_name": "solar",
+         "target_attribute": "capital_cost", "lower_bound": 500000, "upper_bound": 900000},
+        {"param_name": "wind_capex", "component_type": "generator", "component_name": "wind",
+         "target_attribute": "capital_cost", "lower_bound": 800000, "upper_bound": 1450000},
+        {"param_name": "battery_capex", "component_type": "storage_unit", "component_name": "battery",
+         "target_attribute": "capital_cost", "lower_bound": 300000, "upper_bound": 900000},
+        {"param_name": "diesel_opex", "component_type": "generator", "component_name": "diesel",
+         "target_attribute": "marginal_cost", "lower_bound": 200, "upper_bound": 300},
+    ])
 
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         buses.to_excel(writer, sheet_name="buses", index=False)
@@ -173,72 +180,175 @@ def generate_sample_config(path):
         storage_units.to_excel(writer, sheet_name="storage_units", index=False)
         loads.to_excel(writer, sheet_name="loads", index=False)
         timeseries.to_excel(writer, sheet_name="timeseries", index=False)
+        uncertainty_params.to_excel(writer, sheet_name="uncertainty_params", index=False)
     print(f"    [!] {path.name} が見つからないため、サンプル設定ファイルを自動生成しました: {path}")
+
+
+_LINKS_COLUMNS = ["name", "bus0", "bus1", "carrier", "capex", "marginal_cost",
+                   "efficiency", "lifetime", "p_nom_extendable"]
 
 
 def load_network_config(path):
     if not path.exists():
         generate_sample_config(path)
+
+    xls = pd.ExcelFile(path)
+    sheet_names = set(xls.sheet_names)
+    required_sheets = {"buses", "generators", "storage_units", "loads", "timeseries", "uncertainty_params"}
+    missing_sheets = required_sheets - sheet_names
+    if missing_sheets:
+        raise ValueError(f"{path.name} に必須シートがありません: {sorted(missing_sheets)}")
+
     cfg = {
-        "buses": pd.read_excel(path, sheet_name="buses"),
-        "generators": pd.read_excel(path, sheet_name="generators"),
-        "storage_units": pd.read_excel(path, sheet_name="storage_units"),
-        "loads": pd.read_excel(path, sheet_name="loads"),
-        "timeseries": pd.read_excel(path, sheet_name="timeseries"),
+        "buses": pd.read_excel(xls, sheet_name="buses"),
+        "generators": pd.read_excel(xls, sheet_name="generators"),
+        "storage_units": pd.read_excel(xls, sheet_name="storage_units"),
+        "loads": pd.read_excel(xls, sheet_name="loads"),
+        "timeseries": pd.read_excel(xls, sheet_name="timeseries"),
+        "uncertainty_params": pd.read_excel(xls, sheet_name="uncertainty_params"),
     }
+    # links は任意(オプション)シート: hydrogen electrolyzer/fuel cell等をリンクとして表現する場合に使用
+    if "links" in sheet_names:
+        cfg["links"] = pd.read_excel(xls, sheet_name="links")
+    else:
+        cfg["links"] = pd.DataFrame(columns=_LINKS_COLUMNS)
+
     cfg["timeseries"]["timestamp"] = pd.to_datetime(cfg["timeseries"]["timestamp"])
     if len(cfg["timeseries"]) != N_HOURS:
         raise ValueError(
             f"timeseries シートの行数が{N_HOURS}(8760h)ではありません: {len(cfg['timeseries'])}行"
         )
-    for col in ("solar_p_max_pu", "wind_p_max_pu"):
-        vals = cfg["timeseries"][col].to_numpy()
-        if vals.min() < 0 or vals.max() > 1:
-            raise ValueError(f"timeseries.{col} は0.0〜1.0の範囲である必要があります")
+    for col in cfg["timeseries"].columns:
+        if col.endswith("_p_max_pu"):
+            vals = cfg["timeseries"][col].to_numpy()
+            if vals.min() < 0 or vals.max() > 1:
+                raise ValueError(f"timeseries.{col} は0.0〜1.0の範囲である必要があります")
+
+    _validate_uncertainty_params(cfg)
     return cfg
 
 
-def get_lifetime(cfg, name):
-    for sheet in ("generators", "storage_units"):
-        df = cfg[sheet]
-        row = df.loc[df["name"] == name]
-        if not row.empty:
-            return float(row.iloc[0]["lifetime"])
-    raise KeyError(f"'{name}' が generators / storage_units シートに見つかりません")
+def _validate_uncertainty_params(cfg):
+    udf = cfg["uncertainty_params"]
+    required_cols = {"param_name", "component_type", "component_name",
+                      "target_attribute", "lower_bound", "upper_bound"}
+    missing_cols = required_cols - set(udf.columns)
+    if missing_cols:
+        raise ValueError(f"uncertainty_params シートに列が不足しています: {sorted(missing_cols)}")
+    if udf.empty:
+        raise ValueError("uncertainty_params シートに行がありません（最低1パラメータが必要です）")
+    if udf["param_name"].duplicated().any():
+        dup = udf.loc[udf["param_name"].duplicated(), "param_name"].tolist()
+        raise ValueError(f"uncertainty_params.param_name に重複があります: {dup}")
+
+    name_index = {
+        "generator": set(cfg["generators"]["name"].astype(str)),
+        "storage_unit": set(cfg["storage_units"]["name"].astype(str)),
+        "link": set(cfg["links"]["name"].astype(str)) if not cfg["links"].empty else set(),
+    }
+    for _, row in udf.iterrows():
+        pname = row["param_name"]
+        ctype = str(row["component_type"]).strip().lower()
+        cname = str(row["component_name"]).strip()
+        attr = str(row["target_attribute"]).strip()
+        if ctype not in COMPONENT_ATTR:
+            raise ValueError(
+                f"uncertainty_params: 不正な component_type='{ctype}' (param='{pname}'). "
+                f"有効値: {sorted(COMPONENT_ATTR)}"
+            )
+        if attr not in VALID_TARGET_ATTRS:
+            raise ValueError(
+                f"uncertainty_params: 不正な target_attribute='{attr}' (param='{pname}'). "
+                f"有効値: {sorted(VALID_TARGET_ATTRS)}"
+            )
+        if cname not in name_index[ctype]:
+            raise ValueError(
+                f"uncertainty_params: component_name='{cname}' (param='{pname}') が "
+                f"{COMPONENT_ATTR[ctype]} シートに見つかりません"
+            )
+        if float(row["lower_bound"]) >= float(row["upper_bound"]):
+            raise ValueError(f"uncertainty_params: lower_bound >= upper_bound (param='{pname}')")
+
+
+def get_lifetime(cfg, component_type, name):
+    sheet = COMPONENT_ATTR[component_type]
+    df = cfg[sheet]
+    row = df.loc[df["name"].astype(str) == name]
+    if row.empty:
+        raise KeyError(f"'{name}' が {sheet} シートに見つかりません")
+    return float(row.iloc[0]["lifetime"])
 
 
 # ----------------------------------------------------------------------------
-# 3. PyPSA モデル構築 (Excel設定を動的に反映, 8760スナップショット)
+# 2. 不確実性パラメータ (uncertainty_params シートから動的に構成)
+# ----------------------------------------------------------------------------
+def build_problem(cfg):
+    udf = cfg["uncertainty_params"]
+    names = udf["param_name"].astype(str).tolist()
+    bounds = udf[["lower_bound", "upper_bound"]].astype(float).values.tolist()
+    problem = {"num_vars": len(names), "names": names, "bounds": bounds}
+    return problem, udf
+
+
+def build_labels(udf):
+    labels = []
+    for _, row in udf.iterrows():
+        tech = str(row["component_name"]).replace("_", " ").title()
+        kind = "CAPEX" if str(row["target_attribute"]).strip() == "capital_cost" else "OPEX"
+        labels.append(f"{tech} {kind}")
+    return labels
+
+
+def build_lifetimes(cfg, udf):
+    """capital_cost を対象とするパラメータについてのみ (component_type, name) -> lifetime を引く"""
+    lifetimes = {}
+    for _, row in udf.iterrows():
+        if str(row["target_attribute"]).strip() != "capital_cost":
+            continue
+        ctype = str(row["component_type"]).strip().lower()
+        cname = str(row["component_name"]).strip()
+        lifetimes[(ctype, cname)] = get_lifetime(cfg, ctype, cname)
+    return lifetimes
+
+
+# ----------------------------------------------------------------------------
+# 3. PyPSA モデル構築 (Excel設定を動的に反映, 8760スナップショット, 任意電源対応)
 # ----------------------------------------------------------------------------
 def build_network(cfg):
     n = pypsa.Network()
     ts = cfg["timeseries"].set_index("timestamp")
     n.set_snapshots(ts.index)  # 1時間刻み x 8760 -> snapshot_weightings は既定で1
 
-    carriers = sorted(set(cfg["generators"]["carrier"]) | set(cfg["storage_units"]["carrier"]) | {"AC"})
-    n.add("Carrier", carriers)
+    carriers = set(cfg["generators"]["carrier"]) | set(cfg["storage_units"]["carrier"])
+    if not cfg["links"].empty:
+        carriers |= set(cfg["links"]["carrier"].dropna().astype(str))
+    carriers |= {"AC"}
+    n.add("Carrier", sorted(carriers))
 
     for _, row in cfg["buses"].iterrows():
         n.add("Bus", str(row["bus_name"]), v_nom=float(row.get("v_nom", 1.0)))
 
     for _, row in cfg["loads"].iterrows():
-        n.add("Load", str(row["name"]), bus=str(row["bus"]), p_set=ts["load_mw"])
+        name = str(row["name"])
+        col = f"{name}_mw"
+        if col not in ts.columns:
+            raise KeyError(f"timeseries に負荷列 '{col}' がありません (loads.name='{name}')")
+        n.add("Load", name, bus=str(row["bus"]), p_set=ts[col])
 
     for _, row in cfg["generators"].iterrows():
-        carrier = str(row["carrier"])
+        name = str(row["name"])
         kwargs = dict(
             bus=str(row["bus"]),
-            carrier=carrier,
+            carrier=str(row["carrier"]),
             p_nom_extendable=bool(row["p_nom_extendable"]),
             capital_cost=annualized(float(row["capex"]), float(row["lifetime"])),
             marginal_cost=float(row["marginal_cost"]),
             efficiency=float(row.get("efficiency", 1.0)),
         )
-        if carrier == "solar":
-            kwargs["p_max_pu"] = ts["solar_p_max_pu"]
-        elif carrier == "wind":
-            kwargs["p_max_pu"] = ts["wind_p_max_pu"]
-        n.add("Generator", str(row["name"]), **kwargs)
+        pu_col = f"{name}_p_max_pu"  # 命名規則: generators.name + "_p_max_pu"
+        if pu_col in ts.columns:
+            kwargs["p_max_pu"] = ts[pu_col]
+        n.add("Generator", name, **kwargs)
 
     for _, row in cfg["storage_units"].iterrows():
         n.add(
@@ -251,16 +361,38 @@ def build_network(cfg):
             efficiency_dispatch=float(row["efficiency_dispatch"]),
             cyclic_state_of_charge=True,
         )
+
+    for _, row in cfg["links"].iterrows():
+        n.add(
+            "Link", str(row["name"]),
+            bus0=str(row["bus0"]), bus1=str(row["bus1"]),
+            carrier=str(row.get("carrier", "")),
+            p_nom_extendable=bool(row["p_nom_extendable"]),
+            capital_cost=annualized(float(row["capex"]), float(row["lifetime"])),
+            marginal_cost=float(row.get("marginal_cost", 0.0)),
+            efficiency=float(row.get("efficiency", 1.0)),
+        )
     return n
 
 
-def run_pypsa(cfg, params, lifetimes):
-    """1サンプル分のLP(8760h)を解き、最適費用・容量・発電/充放電量を返す。"""
+def apply_uncertainty(n, udf, params, lifetimes):
+    """LHS/Sobolでサンプリングされた params を、uncertainty_params定義に従って
+    対応コンポーネントの capital_cost(CRF年換算) または marginal_cost に適用する。"""
+    for value, (_, row) in zip(params, udf.iterrows()):
+        ctype = str(row["component_type"]).strip().lower()
+        cname = str(row["component_name"]).strip()
+        attr = str(row["target_attribute"]).strip()
+        comp_df = getattr(n, COMPONENT_ATTR[ctype])
+        if attr == "capital_cost":
+            comp_df.loc[cname, attr] = annualized(float(value), lifetimes[(ctype, cname)])
+        else:
+            comp_df.loc[cname, attr] = float(value)
+
+
+def run_pypsa(cfg, params, udf, lifetimes):
+    """1サンプル分のLP(8760h)を解き、最適費用・全電源の容量・発電/充放電量を返す。"""
     n = build_network(cfg)
-    n.generators.loc["solar", "capital_cost"] = annualized(params[0], lifetimes["solar"])
-    n.generators.loc["wind", "capital_cost"] = annualized(params[1], lifetimes["wind"])
-    n.storage_units.loc["battery", "capital_cost"] = annualized(params[2], lifetimes["battery"])
-    n.generators.loc["diesel", "marginal_cost"] = params[3]
+    apply_uncertainty(n, udf, params, lifetimes)
 
     status, cond = n.optimize(solver_name="highs", log_to_console=False,
                               include_objective_constant=False)
@@ -268,30 +400,30 @@ def run_pypsa(cfg, params, lifetimes):
         raise RuntimeError(f"PyPSA最適化に失敗: status={status}, condition={cond}, params={params}")
 
     w = n.snapshot_weightings.generators
-    solar_mwh = float((n.generators_t.p["solar"] * w).sum())
-    wind_mwh = float((n.generators_t.p["wind"] * w).sum())
-    diesel_mwh = float((n.generators_t.p["diesel"] * w).sum())
-    batt_p = n.storage_units_t.p["battery"]
-    battery_discharge_mwh = float((batt_p.clip(lower=0) * w).sum())
+    result = {"total_cost": float(n.objective)}
 
-    return {
-        "total_cost": float(n.objective),
-        "solar_mw": float(n.generators.at["solar", "p_nom_opt"]),
-        "wind_mw": float(n.generators.at["wind", "p_nom_opt"]),
-        "battery_mw": float(n.storage_units.at["battery", "p_nom_opt"]),
-        "diesel_mw": float(n.generators.at["diesel", "p_nom_opt"]),
-        "solar_mwh": solar_mwh,
-        "wind_mwh": wind_mwh,
-        "battery_discharge_mwh": battery_discharge_mwh,
-        "diesel_mwh": diesel_mwh,
-    }
+    for name in n.generators.index:
+        result[f"{name}_mw"] = float(n.generators.at[name, "p_nom_opt"])
+        result[f"{name}_mwh"] = float((n.generators_t.p[name] * w).sum())
+
+    for name in n.storage_units.index:
+        result[f"{name}_mw"] = float(n.storage_units.at[name, "p_nom_opt"])
+        disp = n.storage_units_t.p[name].clip(lower=0)
+        result[f"{name}_discharge_mwh"] = float((disp * w).sum())
+
+    for name in n.links.index:
+        result[f"{name}_mw"] = float(n.links.at[name, "p_nom_opt"])
+        flow = n.links_t.p0[name].clip(lower=0)
+        result[f"{name}_mwh"] = float((flow * w).sum())
+
+    return result
 
 
 # ----------------------------------------------------------------------------
 # 4. メイン
 # ----------------------------------------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="LHS+PCEサロゲートによるPyPSA GSA")
+    p = argparse.ArgumentParser(description="LHS+PCEサロゲートによるPyPSA GSA (任意電源・任意パラメータ対応)")
     p.add_argument("--config", default=str(CONFIG_PATH), help="network_config.xlsx のパス")
     p.add_argument("--n-lhs", type=int, default=N_LHS, help="LHSサンプル数 (既定320)")
     p.add_argument("--n-sobol", type=int, default=N_SOBOL, help="Sobolベースサンプル数 (既定1024)")
@@ -319,12 +451,19 @@ def main():
     # --- ネットワーク設定読み込み (無ければ自動生成) --------------------------------
     print(f"[1] ネットワーク設定を読み込み中: {config_path}")
     cfg = load_network_config(config_path)
-    lifetimes = {name: get_lifetime(cfg, name) for name in ("solar", "wind", "battery", "diesel")}
-    print(f"    耐用年数: {lifetimes}  (割引率={DISCOUNT_RATE})")
+    problem, udf = build_problem(cfg)
+    names = problem["names"]
+    labels = build_labels(udf)
+    lifetimes = build_lifetimes(cfg, udf)
+    num_vars = problem["num_vars"]
+    print(f"    電源: generators={cfg['generators']['name'].tolist()}, "
+          f"storage_units={cfg['storage_units']['name'].tolist()}, "
+          f"links={cfg['links']['name'].tolist() if not cfg['links'].empty else []}")
+    print(f"    不確実性パラメータ({num_vars}次元): {names}")
     print(f"    スナップショット数: {len(cfg['timeseries'])} (8760h, 各1時間重み)")
 
     # --- LHS -----------------------------------------------------------------
-    X = latin_sample.sample(PROBLEM, n_lhs, seed=SEED)
+    X = latin_sample.sample(problem, n_lhs, seed=SEED)
     print(f"[2] LHSサンプル生成: {X.shape}")
 
     # --- PyPSA ----------------------------------------------------------------
@@ -332,11 +471,11 @@ def main():
     rows = []
     report_every = max(1, n_lhs // 8)
     for i, x in enumerate(X):
-        rows.append(run_pypsa(cfg, x, lifetimes))
+        rows.append(run_pypsa(cfg, x, udf, lifetimes))
         if (i + 1) % report_every == 0 or (i + 1) == n_lhs:
             print(f"    {i + 1}/{n_lhs} done  ({time.time() - t0:.0f}s)")
     res = pd.DataFrame(rows)
-    df = pd.concat([pd.DataFrame(X, columns=NAMES), res], axis=1)
+    df = pd.concat([pd.DataFrame(X, columns=names), res], axis=1)
     df.index.name = "sample"
     df.to_csv(os.path.join(output_dir, "pypsa_lhs_320_results.csv"))
 
@@ -345,7 +484,7 @@ def main():
         coords={"sample": np.arange(n_lhs)},
         attrs={
             "title": "PyPSA LHS results",
-            "units_costs": "CAPEX USD/MW (overnight), diesel USD/MWh",
+            "uncertainty_params": ", ".join(names),
             "total_cost_unit": "USD/year", "capacity_unit": "MW", "energy_unit": "MWh/year",
         },
     )
@@ -370,26 +509,26 @@ def main():
     rmse_train = float(np.sqrt(mean_squared_error(y, y_fit)))
     rmse_cv = float(np.sqrt(mean_squared_error(y, y_cv)))
     n_basis = pce.named_steps["poly"].n_output_features_
-    print(f"    基底数 = {n_basis},  最適alpha = {pce.named_steps['ridge'].alpha_:.4g}")
+    print(f"    次元数 = {num_vars},  基底数 = {n_basis},  最適alpha = {pce.named_steps['ridge'].alpha_:.4g}")
     print(f"    学習 R^2 = {r2_train:.5f}   CV(10-fold) R^2 = {r2_cv:.5f}")
     print(f"    学習 RMSE = {rmse_train:,.1f}   CV RMSE = {rmse_cv:,.1f}  [USD/year]")
 
     # --- Sobol on surrogate ------------------------------------------------------
-    print(f"[5] サロゲート上でSobol解析 (N={n_sobol} -> {n_sobol * (2 * 4 + 2)}点)")
-    Xs = sobol_sample.sample(PROBLEM, n_sobol, calc_second_order=True, seed=SEED)
+    print(f"[5] サロゲート上でSobol解析 (N={n_sobol} -> {n_sobol * (2 * num_vars + 2)}点)")
+    Xs = sobol_sample.sample(problem, n_sobol, calc_second_order=True, seed=SEED)
     ts_sobol = time.time()
     Ys = pce.predict(Xs)
     print(f"    サロゲート評価 {len(Xs)}点: {(time.time() - ts_sobol) * 1000:.1f} ms")
-    Si = sobol_analyze.analyze(PROBLEM, Ys, calc_second_order=True, seed=SEED,
+    Si = sobol_analyze.analyze(problem, Ys, calc_second_order=True, seed=SEED,
                                print_to_console=False)
     sens = pd.DataFrame({"S1": Si["S1"], "S1_conf": Si["S1_conf"],
-                         "ST": Si["ST"], "ST_conf": Si["ST_conf"]}, index=NAMES)
+                         "ST": Si["ST"], "ST_conf": Si["ST_conf"]}, index=names)
     print("\n--- 第1次 (S1) / 総 (ST) 感度指標 ---")
     print(sens.round(4).to_string())
 
     s2 = np.nan_to_num(np.asarray(Si["S2"], dtype=float), nan=0.0)
     s2 = s2 + s2.T  # SALibは上三角のみ
-    s2_df = pd.DataFrame(s2, index=NAMES, columns=NAMES)
+    s2_df = pd.DataFrame(s2, index=names, columns=names)
     print("\n--- Sobol 2次感度指標 (Sij) マトリクス (対角=0) ---")
     print(s2_df.round(4).to_string())
     s2_df.to_csv(os.path.join(output_dir, "sobol_s2_matrix.csv"))
@@ -397,42 +536,42 @@ def main():
     # --- Cij -------------------------------------------------------------------
     poly = pce.named_steps["poly"]
     coef = pce.named_steps["ridge"].coef_
-    fnames = poly.get_feature_names_out([f"x{i}" for i in range(4)])
-    cij = np.zeros((4, 4))
-    for name, c in zip(fnames, coef):
-        if "^2" in name:  # 対角: 2乗項 Cii
-            i = int(name.split("^")[0][1:])
+    fnames = poly.get_feature_names_out([f"x{i}" for i in range(num_vars)])
+    cij = np.zeros((num_vars, num_vars))
+    for fname, c in zip(fnames, coef):
+        if "^2" in fname:  # 対角: 2乗項 Cii
+            i = int(fname.split("^")[0][1:])
             cij[i, i] = c
-        elif " " in name:  # 交差項 Cij
-            i, j = (int(t[1:]) for t in name.split())
+        elif " " in fname:  # 交差項 Cij
+            i, j = (int(t[1:]) for t in fname.split())
             cij[i, j] = cij[j, i] = c
-    cij_df = pd.DataFrame(cij, index=NAMES, columns=NAMES)
+    cij_df = pd.DataFrame(cij, index=names, columns=names)
     print("\n--- PCE交差項係数 (Cij) マトリクス [標準化入力空間, 単位: USD/year] "
           "(対角=2乗項Cii) ---")
     print(cij_df.round(1).to_string())
     cij_df.to_csv(os.path.join(output_dir, "pce_interaction_matrix.csv"))
 
-    print("\n--- 技術ペアの関係判定 (総費用最小化: 包絡線定理 dC/dθi = 最適量_i) ---")
+    print("\n--- パラメータペアの関係判定 (総費用最小化: 包絡線定理 dC/dθi = 最適量_i) ---")
     print("    Cij = d2C/dθi dθj = d(最適量_i)/dθj")
     print("    Cij < 0: 補完 (θj上昇で両技術の最適容量が同時に減少 / 総費用増を抑制)")
     print("    Cij > 0: 代替 (θj上昇で技術iへ容量がシフト・置換)")
-    for i in range(4):
-        for j in range(i + 1, 4):
+    for i in range(num_vars):
+        for j in range(i + 1, num_vars):
             c = cij[i, j]
             tag = ("【補完関係 (容量連動・シナジー)】" if c < 0
                    else "【代替関係 (技術競合・置換)】" if c > 0 else "【無相互作用】")
-            print(f"  {NAMES[i]:>21s} x {NAMES[j]:<21s}  Cij = {c:>12,.1f}  {tag}  "
+            print(f"  {names[i]:>21s} x {names[j]:<21s}  Cij = {c:>12,.1f}  {tag}  "
                   f"(Sij = {s2_df.iloc[i, j]:.4f})")
 
     # --- プロット ----------------------------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, axes = plt.subplots(1, 2, figsize=(max(9, 2.6 * num_vars + 4), 5.5))
     ax = axes[0]
-    pos = np.arange(4)
+    pos = np.arange(num_vars)
     w = 0.38
     ax.bar(pos - w / 2, sens["S1"], w, yerr=sens["S1_conf"], label="S1", color="#4c72b0", capsize=3)
     ax.bar(pos + w / 2, sens["ST"], w, yerr=sens["ST_conf"], label="ST", color="#dd8452", capsize=3)
     ax.set_xticks(pos)
-    ax.set_xticklabels(LABELS, rotation=15)
+    ax.set_xticklabels(labels, rotation=25, ha="right")
     ax.set_ylabel("Sobol index")
     ax.set_title("Sobol sensitivity (on PCE surrogate)")
     ax.legend()

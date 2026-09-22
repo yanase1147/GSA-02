@@ -1,45 +1,46 @@
 # PyPSA × LHS × PCE サロゲート グローバル感度分析 (GSA)
 
 ## 概要
-単一ノードのPyPSA容量拡張モデル（太陽光・風力・定置型蓄電池・ディーゼル、**8760時間 = 1年間フル時系列**）の
-年間総費用（年換算CAPEX＋OPEX）を目的関数とし、4つのコスト不確実性パラメータの影響を次のパイプラインで評価します。
+PyPSA容量拡張モデル（**8760時間 = 1年間フル時系列**）の年間総費用（年換算CAPEX＋OPEX）を目的関数とし、
+Excelで自由に定義した任意個数・任意技術のコスト不確実性パラメータの影響を次のパイプラインで評価します。
 
 ```
 network_config.xlsx → LHS(320点) → PyPSA(LP, 8760h) → PCEサロゲート学習
                      → サロゲート上GSA(10,240点) → Sobol S1/ST/Sij・Cij
 ```
 
-- ネットワーク構成（ノード・発電機・蓄電池・需要の基本定義）と8760時間の時系列データは、すべて
-  `network_config.xlsx` 1ファイルから動的に読み込みます（コード埋め込みではありません）。
+- ネットワーク構成（ノード・発電機・蓄電池・リンク・需要の基本定義）、8760時間の時系列データ、および
+  **不確実性パラメータの定義そのもの**が、すべて `network_config.xlsx` 1ファイルから動的に読み込まれます
+  （コード埋め込みではありません）。
+- **任意電源の追加はExcelのみで完結**: `generators`/`storage_units`（任意で`links`）シートに行を追加するだけで、
+  コード変更なしに新しい技術（水素、水力、原子力等）がPyPSAネットワークへ組み込まれ最適化されます。
+- **不確実性パラメータも任意個数**: `uncertainty_params` シートの行数がそのままLHS/Sobolの次元数、
+  PCE多項式基底数（`C(n+2,2)`）、Sobol S1/ST/Sijマトリクスのサイズに自動反映されます（コード側の次元数は
+  一切ハードコードされていません）。
 - **ファイルが存在しない場合はエラー終了せず**、リアリスティックな合成データを含むサンプル
-  `network_config.xlsx` を自動生成して実行を継続します。
-- **CAPEXの年換算 (CRF)**: 各技術シートの `capex` [$/MW] と `lifetime` [年] を用いて資本回収係数で年換算し
-  `capital_cost` [$/MW/year] とします。
+  `network_config.xlsx`（太陽光・風力・蓄電池・ディーゼルの4技術、4パラメータ）を自動生成して実行を継続します。
+- **CAPEXの年換算 (CRF)**: 対象電源シートの `capex` [$/MW] と `lifetime` [年] を用いて資本回収係数で年換算し
+  `capital_cost` [$/MW/year] とします（`target_attribute=capital_cost` のパラメータにのみ適用）。
 
-  `CRF = r(1+r)^n / ((1+r)^n − 1)`,  割引率 r = 5%（`DISCOUNT_RATE` で固定）
+  `CRF = r(1+r)^n / ((1+r)^n − 1)`,  割引率 r = 5%（`DISCOUNT_RATE` で固定、全電源共通）
 
-| 技術 | 耐用年数 n（既定値） | CRF |
-|---|---|---|
-| 太陽光 solar | 25年 | 0.07095 |
-| 風力 wind | 25年 | 0.07095 |
-| 蓄電池 battery | 12年 | 0.11283 |
-| ディーゼル diesel | 20年 | 0.08024 |
+  `target_attribute=marginal_cost`（可変費/OPEX）のパラメータはCRFを適用せず、サンプル値をそのまま使用します。
 
-  ディーゼルの初期建設費は不確実性の対象外で、Excelの `generators` シートの値（既定 800,000 $/MW）に固定です。
+- 既定サンプル設定での不確実性パラメータ（4次元）:
 
-- 不確実性パラメータ（LHS/Sobolで振る4次元, `PROBLEM["bounds"]` で編集可能）:
+| `param_name` | `component_type` | `component_name` | `target_attribute` | 範囲 | 単位 |
+|---|---|---|---|---|---|
+| `solar_capex` | generator | solar | capital_cost | 500,000 – 900,000 | $/MW（CRFで年換算） |
+| `wind_capex` | generator | wind | capital_cost | 800,000 – 1,450,000 | $/MW（同上） |
+| `battery_capex` | storage_unit | battery | capital_cost | 300,000 – 900,000 | $/MW（同上） |
+| `diesel_opex` | generator | diesel | marginal_cost | 200 – 300 | $/MWh（燃料可変費） |
 
-| 名称 | 範囲 | 単位 |
-|---|---|---|
-| `solar_cost` | 500,000 – 900,000 | $/MW（初期建設費, CRFで年換算） |
-| `wind_cost` | 800,000 – 1,450,000 | $/MW（同上） |
-| `battery_cost` | 300,000 – 900,000 | $/MW（同上） |
-| `diesel_marginal_cost` | 200 – 300 | $/MWh（燃料可変費） |
+  ※ Excel側の各電源シートの `capex`/`marginal_cost` は「サンプリング前のベース値」で、`uncertainty_params` に
+  登録された行についてはLHS/Sobolでサンプリングした値が対応する `capital_cost`/`marginal_cost` を上書きします。
+  未登録の属性はExcelのベース値のまま固定されます。
 
-  ※ Excel側の `capex`/`marginal_cost` は「サンプル生成前のベース値」であり、実際の感度分析では上記範囲で
-  独立にLHS/Sobolサンプリングした値で各技術の `capital_cost`（またはディーゼルの `marginal_cost`）を上書きします。
-
-- サロゲート: `StandardScaler → PolynomialFeatures(2) → RidgeCV(alphas=logspace(-4,3,30), cv=10)`（基底15個）。
+- サロゲート: `StandardScaler → PolynomialFeatures(2) → RidgeCV(alphas=logspace(-4,3,30), cv=10)`
+  （基底数は次元数nから `C(n+2,2)` で自動決定。既定4次元では15個）。
 - 必須ライブラリが不足している場合は、不足名を表示して `sys.exit(1)` します（ダミーデータへのフォールバックなし）。
   PyPSAの最適化が失敗した場合も例外で停止します。
 
@@ -60,21 +61,50 @@ GSA-02/
 ```
 
 ## `network_config.xlsx` のシート構成と編集方法
-既存の値を変えたり技術構成を調整したりする場合は、このExcelファイルを直接編集してください。
+既存の値を変えたり技術構成・不確実性パラメータを調整したりする場合は、このExcelファイルを直接編集してください。
+**コードの変更は不要です。**
 
 | シート | 必須列 | 説明 |
 |---|---|---|
 | `buses` | `bus_name`, `v_nom` | ノード定義（既定は単一ノード `bus`） |
-| `generators` | `name`, `bus`, `carrier`, `capex`, `marginal_cost`, `efficiency`, `lifetime`, `p_nom_extendable` | 発電機の基本定義。`carrier` が `solar`/`wind` の行は `timeseries` の対応する `*_p_max_pu` 列が自動で出力上限として適用されます |
-| `storage_units` | `name`, `bus`, `carrier`, `capex`, `max_hours`, `efficiency_store`, `efficiency_dispatch`, `lifetime`, `p_nom_extendable` | 蓄電池の基本定義 |
-| `loads` | `name`, `bus` | 需要の基本定義（実データは `timeseries.load_mw`） |
-| `timeseries` | `timestamp`, `solar_p_max_pu`, `wind_p_max_pu`, `load_mw` | **8,760行**（1年・1時間刻み）。`solar_p_max_pu`/`wind_p_max_pu` は0.0〜1.0、`load_mw` は需要[MW] |
+| `generators` | `name`, `bus`, `carrier`, `capex`, `marginal_cost`, `efficiency`, `lifetime`, `p_nom_extendable` | 発電機の基本定義。行を追加するだけで新しい発電技術（水力・原子力・水素発電等）を組み込めます |
+| `storage_units` | `name`, `bus`, `carrier`, `capex`, `max_hours`, `efficiency_store`, `efficiency_dispatch`, `lifetime`, `p_nom_extendable` | 蓄電池等の基本定義 |
+| `loads` | `name`, `bus` | 需要の基本定義（実データは `timeseries` の対応列） |
+| `timeseries` | `timestamp`, 各種`*_p_max_pu`, 各種`*_mw` | **8,760行**（1年・1時間刻み） |
+| `uncertainty_params` | `param_name`, `component_type`, `component_name`, `target_attribute`, `lower_bound`, `upper_bound` | **不確実性パラメータの定義**。行数がそのままLHS/Sobol/PCEの次元数になります |
+| `links`（任意） | `name`, `bus0`, `bus1`, `carrier`, `capex`, `marginal_cost`, `efficiency`, `lifetime`, `p_nom_extendable` | 電解槽・燃料電池等をリンクとして表現する場合にのみ追加（無ければ無視されます） |
 
-- 感度分析の対象4技術（`solar`, `wind`, `battery`, `diesel`）は、`generators`/`storage_units` シートの `name` 列で
-  この名前と一致する行が使われます（各シートの `lifetime` がCRF年換算に使われます）。
-- `timeseries` の行数が8760でない場合、または `*_p_max_pu` が0〜1の範囲外の場合はエラーで停止します。
-- ファイルが存在しない場合、上記スキーマに従うサンプルデータ（決定論的な合成気象・負荷プロファイル、固定シード）
-  を自動生成します。
+### 命名規則（時系列列とコンポーネントの対応付け）
+- 可変出力の発電機（太陽光・風力・水力等）は、`timeseries` に `<generators.name>_p_max_pu` 列（0.0〜1.0）を
+  用意すると自動的に出力上限として適用されます（例: 名前 `hydro` なら列名 `hydro_p_max_pu`）。列が無い発電機は
+  ディーゼル・原子力のように `p_nom` まで自由に出力できる電源として扱われます。
+- 需要は `timeseries` に `<loads.name>_mw` 列（既定は `load_mw`）が必要です。
+
+### `uncertainty_params` シート（不確実性パラメータの汎用登録）
+| 列名 | 説明 |
+|---|---|
+| `param_name` | パラメータ識別名（一意。LHS/Sobol/PCEの変数名・結果列名として使用） |
+| `component_type` | `generator` / `storage_unit` / `link` のいずれか |
+| `component_name` | 対象電源の名前（対応シートの `name` 列と一致している必要あり） |
+| `target_attribute` | `capital_cost`（固定費/CAPEX, CRFで自動年換算）または `marginal_cost`（可変費/OPEX, そのまま適用） |
+| `lower_bound` / `upper_bound` | LHS/Sobolでサンプリングする範囲 |
+
+- 行を追加・削除するだけで、LHS/PCE/Sobol/Cijのすべてが自動的に次元数を追従します（コード側は次元数を
+  ハードコードしていません）。
+- 同一電源に対して固定費と可変費の両方を不確実性パラメータとして同時登録することも可能です
+  （例: `diesel_capex` と `diesel_opex` を両方登録）。
+- `uncertainty_params` に登録されていない属性は、対応シートのベース値（`capex`/`marginal_cost`）に固定されます。
+- `component_name` が対応シートに存在しない、`target_attribute` が不正、`lower_bound >= upper_bound` などの
+  場合は起動時にエラーで停止します（サイレントに無視されることはありません）。
+- `timeseries` の行数が8760でない場合、または `*_p_max_pu` 列が0〜1の範囲外の場合もエラーで停止します。
+- ファイルが存在しない場合、上記スキーマに従うサンプルデータ（太陽光・風力・蓄電池・ディーゼルの4技術、
+  決定論的な合成気象・負荷プロファイル、固定シード）を自動生成します。
+
+### 拡張例: 新技術（原子力）の追加
+1. `generators` シートに1行追加: `name=nuclear, bus=bus, carrier=nuclear, capex=6000000, marginal_cost=15, efficiency=0.33, lifetime=40, p_nom_extendable=TRUE`
+2. `uncertainty_params` シートに1行追加: `param_name=nuclear_capex, component_type=generator, component_name=nuclear, target_attribute=capital_cost, lower_bound=4000000, upper_bound=8000000`
+3. `python pypsa_pce_gsa.py` を実行するだけで、5次元LHS/PCE/Sobol（基底数21）に自動的に拡張されます。
+   出力CSVにも `nuclear_mw` / `nuclear_mwh` 列が自動的に追加されます。
 
 ## 環境構築
 ```bash
@@ -104,9 +134,9 @@ python pypsa_pce_gsa.py --config network_config.xlsx --n-lhs 320 --n-sobol 1024
 ## 出力ファイル
 | ファイル | 内容 |
 |---|---|
-| `pypsa_lhs_320_results.csv` / `.nc` | 各サンプルの入力（CAPEX [$/MW], ディーゼル可変費 [$/MWh]）、最適総コスト `total_cost`[$/year]、最適容量 `solar_mw, wind_mw, battery_mw, diesel_mw`[MW]、年間発電/充放電量 `solar_mwh, wind_mwh, battery_discharge_mwh, diesel_mwh`[MWh/year] |
-| `sobol_s2_matrix.csv` | Sobol 2次感度指標 Sij の4×4対称行列（対角=0） |
-| `pce_interaction_matrix.csv` | PCE交差項係数 Cij の4×4対称行列（対角=2乗項係数 Cii） |
+| `pypsa_lhs_320_results.csv` / `.nc` | 各サンプルの入力（`uncertainty_params.param_name`列群）、最適総コスト `total_cost`[$/year]、**ネットワーク内の全発電機/蓄電池/リンクについて自動生成される** `<name>_mw`（最適容量）と `<name>_mwh`（年間発電量、蓄電池は`<name>_discharge_mwh`）列 |
+| `sobol_s2_matrix.csv` | Sobol 2次感度指標 Sij のn×n対称行列（対角=0, n=不確実性パラメータ数） |
+| `pce_interaction_matrix.csv` | PCE交差項係数 Cij のn×n対称行列（対角=2乗項係数 Cii） |
 | `pypsa_pce_gsa_results.png` | 左: S1/ST棒グラフ、右: PyPSA vs PCE 1:1プロット（R², CV R²） |
 
 ## 結果の解釈ルール
@@ -125,8 +155,8 @@ python pypsa_pce_gsa.py --config network_config.xlsx --n-lhs 320 --n-sobol 1024
   補完技術が同時に縮小するため、総費用の増加が抑えられます。
 - **Cij > 0 【代替関係 (技術競合・置換)】**: θj が上がると技術 i の最適容量が増える＝コストが上がった技術から
   もう一方へ容量がシフト（置換）される競合関係。
-- 注意: `diesel_marginal_cost` は容量ではなく発電量（エネルギー）に対するコストのため、ディーゼルを含むペアでは
-  「最適量」はディーゼルの発電量を指します。
+- 注意: `target_attribute=marginal_cost` のパラメータ（可変費/OPEX）は容量ではなく発電量（エネルギー）に
+  対するコストのため、そのパラメータを含むペアでは「最適量」は該当電源の発電量を指します。
 - Cij は符号付きの係数、Sij は分散寄与割合であり別の量です（Cijが大きくてもSijは小さいことがあります）。
 - サロゲートの信頼性は 学習R²・CV R²・RMSE で確認してください（CV R²が低い場合はGSA結果を信頼しないでください）。
 
