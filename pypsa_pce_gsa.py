@@ -515,10 +515,27 @@ def main():
     print("[3] PyPSA最適化(8760h)を実行中 ...")
     rows = []
     report_every = max(1, n_lhs // 8)
-    for i, x in enumerate(X):
-        rows.append(run_pypsa(cfg, x, udf, lifetimes))
-        if (i + 1) % report_every == 0 or (i + 1) == n_lhs:
-            print(f"    {i + 1}/{n_lhs} done  ({time.time() - t0:.0f}s)")
+    try:
+        for i, x in enumerate(X):
+            rows.append(run_pypsa(cfg, x, udf, lifetimes))
+            if (i + 1) % report_every == 0 or (i + 1) == n_lhs:
+                print(f"    {i + 1}/{n_lhs} done  ({time.time() - t0:.0f}s)")
+    except Exception:
+        # 失敗時、それまでに完了した分だけでも退避する(8760h LPは1点あたり高コストなため)。
+        # フォールバックはせず、失敗自体はここで揉み消さずに再送出する。
+        if rows:
+            partial_res = pd.DataFrame(rows)
+            partial_df = pd.concat(
+                [pd.DataFrame(X[:len(rows)], columns=names), partial_res], axis=1
+            )
+            partial_df.index.name = "sample"
+            partial_path = os.path.join(
+                output_dir, f"pypsa_lhs_{n_lhs}_results_partial_{len(rows)}.csv"
+            )
+            partial_df.to_csv(partial_path)
+            print(f"    [!] {len(rows)}/{n_lhs} 件の完了分を退避しました: {partial_path}",
+                  file=sys.stderr)
+        raise
     res = pd.DataFrame(rows)
     df = pd.concat([pd.DataFrame(X, columns=names), res], axis=1)
     df.index.name = "sample"
@@ -544,7 +561,9 @@ def main():
     print("[4] PCEサロゲート学習 (StandardScaler -> Poly(2) -> RidgeCV)")
     pce = Pipeline([
         ("scaler", StandardScaler()),
-        ("poly", PolynomialFeatures(degree=2, include_bias=True)),
+        # RidgeCVがfit_intercept=True(既定)で自前の切片を推定するため、
+        # PolynomialFeatures側のバイアス列(定数項)は不要(二重の切片を避ける)。
+        ("poly", PolynomialFeatures(degree=2, include_bias=False)),
         ("ridge", RidgeCV(alphas=np.logspace(-4, 3, 30), cv=10)),
     ])
     pce.fit(X, y)
