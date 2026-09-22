@@ -1,11 +1,21 @@
 #!/usr/bin/env python
 """
-LHS (320点) -> PyPSA -> PCEサロゲート -> サロゲート上GSA (10,240点) -> Sobol / Cij 解析
+Excel(network_config.xlsx) -> LHS(320点) -> PyPSA(8760h) -> PCEサロゲート
+                            -> サロゲート上GSA(10,240点) -> Sobol / Cij 解析
 
 実行:  python pypsa_pce_gsa.py
+       python pypsa_pce_gsa.py --n-lhs 8 --n-sobol 16   (動作確認用の縮小実行)
 """
 import importlib
 import sys
+
+# Windows既定コードページ(cp932等)では日本語出力が文字化けするため、UTF-8に固定する。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 # ----------------------------------------------------------------------------
 # 0. 必須ライブラリのチェック (不足時はフォールバックせず即停止)
@@ -20,6 +30,7 @@ REQUIRED = {  # import名: pip/conda名
     "SALib": "salib",
     "pypsa": "pypsa",
     "highspy": "highspy",
+    "openpyxl": "openpyxl",
 }
 missing = []
 for mod, pkg in REQUIRED.items():
@@ -33,6 +44,7 @@ if missing:
           file=sys.stderr)
     sys.exit(1)
 
+import argparse
 import logging
 import os
 import time
@@ -60,12 +72,14 @@ logging.getLogger("linopy").setLevel(logging.ERROR)
 logging.getLogger("highspy").setLevel(logging.ERROR)
 
 BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "network_config.xlsx"
 SEED = 42
 N_LHS = 320
 N_SOBOL = 1024
+N_HOURS = 8760
 
 # ----------------------------------------------------------------------------
-# 1. 不確実性パラメータ
+# 1. 不確実性パラメータ (LHS/Sobolで振る4つのコストパラメータ)
 # ----------------------------------------------------------------------------
 PROBLEM = {
     "num_vars": 4,
@@ -76,10 +90,7 @@ PROBLEM = {
 NAMES = PROBLEM["names"]
 LABELS = ["Solar CAPEX", "Wind CAPEX", "Battery CAPEX", "Diesel fuel cost"]
 
-# 耐用年数 [年] と割引率 (CAPEX の年換算用)
-DISCOUNT_RATE = 0.05
-LIFETIME = {"solar": 25, "wind": 25, "battery": 12, "diesel": 20}
-DIESEL_CAPEX = 800000.0  # ディーゼル初期建設費 [$/MW] (不確実性の対象外, 固定)
+DISCOUNT_RATE = 0.05  # 割引率 (CAPEXの年換算 CRF 計算用)
 
 
 def crf(rate, lifetime):
@@ -90,97 +101,213 @@ def crf(rate, lifetime):
     return rate * f / (f - 1)
 
 
-def annualized(capex, tech):
+def annualized(capex, lifetime, rate=DISCOUNT_RATE):
     """初期建設費 [$/MW] -> 年換算コスト capital_cost [$/MW/year]"""
-    return capex * crf(DISCOUNT_RATE, LIFETIME[tech])
+    return capex * crf(rate, lifetime)
 
 
 # ----------------------------------------------------------------------------
-# 2. PyPSA モデル (単一ノード, 太陽光/風力/蓄電池/ディーゼル)
+# 2. network_config.xlsx の読み込み / 自動生成
 # ----------------------------------------------------------------------------
-def build_profiles():
-    """決定論的な年間8760h合成プロファイルを作り、3時間平均 -> 5ステップおき(=15h間隔)で
-    584ステップの代表スナップショットに縮約する。"""
-    idx = pd.date_range("2019-01-01", periods=8760, freq="h")
+def _build_synthetic_timeseries():
+    """決定論的な8760時間(1年・1時間刻み)の合成プロファイルを生成する。"""
+    idx = pd.date_range("2025-01-01", periods=N_HOURS, freq="h")  # 非うるう年(365日x24h=8760h)
     h = np.asarray(idx.hour)
     doy = np.asarray(idx.dayofyear)
     rng = np.random.default_rng(2024)  # 固定シードの合成天候変動
 
-    # 負荷 [MW]: 平均~100MW, 日変動 + 季節変動
+    # 負荷 [MW]: 平均~100MW, 日変動 + 季節変動 + ノイズ
     load = (100 + 15 * np.sin(2 * np.pi * (h - 9) / 24)
             + 10 * np.cos(2 * np.pi * (doy - 20) / 365))
-    load = load * (1 + 0.03 * rng.standard_normal(8760))
+    load = load * (1 + 0.03 * rng.standard_normal(N_HOURS))
+    load = np.clip(load, 5, None)
 
-    # 太陽光 CF: 日中の半正弦 x 季節振幅 x 曇天係数
+    # 太陽光出力比率: 日中の半正弦 x 季節振幅 x 曇天係数
     daylight = np.clip(np.sin(np.pi * (h - 6) / 12), 0, None)
     season = 0.75 + 0.25 * np.sin(2 * np.pi * (doy - 80) / 365)
-    cloud = np.clip(1 - 0.5 * np.abs(pd.Series(rng.standard_normal(365)).rolling(3, min_periods=1)
-                                      .mean().to_numpy())[doy - 1], 0.2, 1)
+    cloud_daily = np.clip(
+        1 - 0.5 * np.abs(pd.Series(rng.standard_normal(366)).rolling(3, min_periods=1).mean().to_numpy()),
+        0.2, 1,
+    )
+    cloud = cloud_daily[doy - 1]
     solar = np.clip(0.85 * daylight * season * cloud, 0, 1)
 
-    # 風力 CF: AR(1) 的な風速変動 + 冬季強め + 夜間やや強め
-    z = np.zeros(8760)
-    e = rng.standard_normal(8760)
-    for t in range(1, 8760):
+    # 風力出力比率: AR(1)的な風速変動 + 冬季強め + 夜間やや強め
+    z = np.zeros(N_HOURS)
+    e = rng.standard_normal(N_HOURS)
+    for t in range(1, N_HOURS):
         z[t] = 0.97 * z[t - 1] + 0.25 * e[t]
     wind = np.clip(0.35 + 0.15 * z + 0.08 * np.cos(2 * np.pi * (doy - 10) / 365)
                    + 0.05 * np.cos(2 * np.pi * h / 24), 0, 1)
 
-    df = pd.DataFrame({"load": load, "solar": solar, "wind": wind}, index=idx)
-    df = df.resample("3h").mean().iloc[::5]  # 2920 -> 584 ステップ
-    assert len(df) == 584, len(df)
-    return df
+    return pd.DataFrame({
+        "timestamp": idx,
+        "solar_p_max_pu": solar,
+        "wind_p_max_pu": wind,
+        "load_mw": load,
+    })
 
 
-PROFILES = build_profiles()
-STEP_HOURS = 3 * 5  # 各代表ステップが表す時間 [h] (584 x 15 = 8760h)
+def generate_sample_config(path):
+    """network_config.xlsx が存在しない場合に、リアリスティックなサンプルを自動生成する。"""
+    timeseries = _build_synthetic_timeseries()
+    buses = pd.DataFrame({"bus_name": ["bus"], "v_nom": [0.4]})
+    generators = pd.DataFrame([
+        {"name": "solar", "bus": "bus", "carrier": "solar", "capex": 700000.0,
+         "marginal_cost": 0.0, "efficiency": 1.0, "lifetime": 25, "p_nom_extendable": True},
+        {"name": "wind", "bus": "bus", "carrier": "wind", "capex": 1100000.0,
+         "marginal_cost": 0.0, "efficiency": 1.0, "lifetime": 25, "p_nom_extendable": True},
+        {"name": "diesel", "bus": "bus", "carrier": "diesel", "capex": 800000.0,
+         "marginal_cost": 250.0, "efficiency": 0.40, "lifetime": 20, "p_nom_extendable": True},
+    ])
+    storage_units = pd.DataFrame([
+        {"name": "battery", "bus": "bus", "carrier": "battery", "capex": 600000.0,
+         "max_hours": 4, "efficiency_store": 0.95, "efficiency_dispatch": 0.95,
+         "lifetime": 12, "p_nom_extendable": True},
+    ])
+    loads = pd.DataFrame([{"name": "load", "bus": "bus"}])
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        buses.to_excel(writer, sheet_name="buses", index=False)
+        generators.to_excel(writer, sheet_name="generators", index=False)
+        storage_units.to_excel(writer, sheet_name="storage_units", index=False)
+        loads.to_excel(writer, sheet_name="loads", index=False)
+        timeseries.to_excel(writer, sheet_name="timeseries", index=False)
+    print(f"    [!] {path.name} が見つからないため、サンプル設定ファイルを自動生成しました: {path}")
 
 
-def build_network():
+def load_network_config(path):
+    if not path.exists():
+        generate_sample_config(path)
+    cfg = {
+        "buses": pd.read_excel(path, sheet_name="buses"),
+        "generators": pd.read_excel(path, sheet_name="generators"),
+        "storage_units": pd.read_excel(path, sheet_name="storage_units"),
+        "loads": pd.read_excel(path, sheet_name="loads"),
+        "timeseries": pd.read_excel(path, sheet_name="timeseries"),
+    }
+    cfg["timeseries"]["timestamp"] = pd.to_datetime(cfg["timeseries"]["timestamp"])
+    if len(cfg["timeseries"]) != N_HOURS:
+        raise ValueError(
+            f"timeseries シートの行数が{N_HOURS}(8760h)ではありません: {len(cfg['timeseries'])}行"
+        )
+    for col in ("solar_p_max_pu", "wind_p_max_pu"):
+        vals = cfg["timeseries"][col].to_numpy()
+        if vals.min() < 0 or vals.max() > 1:
+            raise ValueError(f"timeseries.{col} は0.0〜1.0の範囲である必要があります")
+    return cfg
+
+
+def get_lifetime(cfg, name):
+    for sheet in ("generators", "storage_units"):
+        df = cfg[sheet]
+        row = df.loc[df["name"] == name]
+        if not row.empty:
+            return float(row.iloc[0]["lifetime"])
+    raise KeyError(f"'{name}' が generators / storage_units シートに見つかりません")
+
+
+# ----------------------------------------------------------------------------
+# 3. PyPSA モデル構築 (Excel設定を動的に反映, 8760スナップショット)
+# ----------------------------------------------------------------------------
+def build_network(cfg):
     n = pypsa.Network()
-    n.set_snapshots(PROFILES.index)
-    n.snapshot_weightings.loc[:, :] = STEP_HOURS  # objective / generators / stores 全てに適用
-    n.add("Bus", "bus")
-    n.add("Load", "load", bus="bus", p_set=PROFILES["load"])
-    n.add("Generator", "solar", bus="bus", carrier="solar", p_nom_extendable=True,
-          p_max_pu=PROFILES["solar"], capital_cost=annualized(700000.0, "solar"), marginal_cost=0.0)
-    n.add("Generator", "wind", bus="bus", carrier="wind", p_nom_extendable=True,
-          p_max_pu=PROFILES["wind"], capital_cost=annualized(1100000.0, "wind"), marginal_cost=0.0)
-    n.add("Generator", "diesel", bus="bus", carrier="diesel", p_nom_extendable=True,
-          capital_cost=annualized(DIESEL_CAPEX, "diesel"), marginal_cost=250.0)
-    n.add("StorageUnit", "battery", bus="bus", carrier="battery", p_nom_extendable=True,
-          max_hours=4, capital_cost=annualized(600000.0, "battery"), marginal_cost=0.0,
-          efficiency_store=0.95, efficiency_dispatch=0.95, cyclic_state_of_charge=True)
+    ts = cfg["timeseries"].set_index("timestamp")
+    n.set_snapshots(ts.index)  # 1時間刻み x 8760 -> snapshot_weightings は既定で1
+
+    carriers = sorted(set(cfg["generators"]["carrier"]) | set(cfg["storage_units"]["carrier"]) | {"AC"})
+    n.add("Carrier", carriers)
+
+    for _, row in cfg["buses"].iterrows():
+        n.add("Bus", str(row["bus_name"]), v_nom=float(row.get("v_nom", 1.0)))
+
+    for _, row in cfg["loads"].iterrows():
+        n.add("Load", str(row["name"]), bus=str(row["bus"]), p_set=ts["load_mw"])
+
+    for _, row in cfg["generators"].iterrows():
+        carrier = str(row["carrier"])
+        kwargs = dict(
+            bus=str(row["bus"]),
+            carrier=carrier,
+            p_nom_extendable=bool(row["p_nom_extendable"]),
+            capital_cost=annualized(float(row["capex"]), float(row["lifetime"])),
+            marginal_cost=float(row["marginal_cost"]),
+            efficiency=float(row.get("efficiency", 1.0)),
+        )
+        if carrier == "solar":
+            kwargs["p_max_pu"] = ts["solar_p_max_pu"]
+        elif carrier == "wind":
+            kwargs["p_max_pu"] = ts["wind_p_max_pu"]
+        n.add("Generator", str(row["name"]), **kwargs)
+
+    for _, row in cfg["storage_units"].iterrows():
+        n.add(
+            "StorageUnit", str(row["name"]),
+            bus=str(row["bus"]), carrier=str(row["carrier"]),
+            p_nom_extendable=bool(row["p_nom_extendable"]),
+            max_hours=float(row["max_hours"]),
+            capital_cost=annualized(float(row["capex"]), float(row["lifetime"])),
+            efficiency_store=float(row["efficiency_store"]),
+            efficiency_dispatch=float(row["efficiency_dispatch"]),
+            cyclic_state_of_charge=True,
+        )
     return n
 
 
-def run_pypsa(params):
-    """1サンプル分のLPを解き、総コストと最適容量を返す。"""
-    n = build_network()
-    n.generators.loc["solar", "capital_cost"] = annualized(params[0], "solar")
-    n.generators.loc["wind", "capital_cost"] = annualized(params[1], "wind")
-    n.storage_units.loc["battery", "capital_cost"] = annualized(params[2], "battery")
+def run_pypsa(cfg, params, lifetimes):
+    """1サンプル分のLP(8760h)を解き、最適費用・容量・発電/充放電量を返す。"""
+    n = build_network(cfg)
+    n.generators.loc["solar", "capital_cost"] = annualized(params[0], lifetimes["solar"])
+    n.generators.loc["wind", "capital_cost"] = annualized(params[1], lifetimes["wind"])
+    n.storage_units.loc["battery", "capital_cost"] = annualized(params[2], lifetimes["battery"])
     n.generators.loc["diesel", "marginal_cost"] = params[3]
+
     status, cond = n.optimize(solver_name="highs", log_to_console=False,
                               include_objective_constant=False)
     if status != "ok":
         raise RuntimeError(f"PyPSA最適化に失敗: status={status}, condition={cond}, params={params}")
+
+    w = n.snapshot_weightings.generators
+    solar_mwh = float((n.generators_t.p["solar"] * w).sum())
+    wind_mwh = float((n.generators_t.p["wind"] * w).sum())
+    diesel_mwh = float((n.generators_t.p["diesel"] * w).sum())
+    batt_p = n.storage_units_t.p["battery"]
+    battery_discharge_mwh = float((batt_p.clip(lower=0) * w).sum())
+
     return {
         "total_cost": float(n.objective),
         "solar_mw": float(n.generators.at["solar", "p_nom_opt"]),
         "wind_mw": float(n.generators.at["wind", "p_nom_opt"]),
-        "diesel_mw": float(n.generators.at["diesel", "p_nom_opt"]),
         "battery_mw": float(n.storage_units.at["battery", "p_nom_opt"]),
+        "diesel_mw": float(n.generators.at["diesel", "p_nom_opt"]),
+        "solar_mwh": solar_mwh,
+        "wind_mwh": wind_mwh,
+        "battery_discharge_mwh": battery_discharge_mwh,
+        "diesel_mwh": diesel_mwh,
     }
 
 
 # ----------------------------------------------------------------------------
-# 3. メイン
+# 4. メイン
 # ----------------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="LHS+PCEサロゲートによるPyPSA GSA")
+    p.add_argument("--config", default=str(CONFIG_PATH), help="network_config.xlsx のパス")
+    p.add_argument("--n-lhs", type=int, default=N_LHS, help="LHSサンプル数 (既定320)")
+    p.add_argument("--n-sobol", type=int, default=N_SOBOL, help="Sobolベースサンプル数 (既定1024)")
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
+    n_lhs = args.n_lhs
+    n_sobol = args.n_sobol
+    config_path = Path(args.config)
+
     t0 = time.time()
     print("=" * 78)
-    print(" LHS(320) -> PyPSA -> PCEサロゲート -> Sobol GSA(10,240)")
+    print(f" network_config.xlsx -> LHS({n_lhs}) -> PyPSA(8760h) -> PCEサロゲート"
+          f" -> Sobol GSA({n_sobol})")
     print("=" * 78)
 
     # --- 出力先ディレクトリ (タイムスタンプ付き) -----------------------------------
@@ -189,17 +316,25 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     print(f"[0] 出力先フォルダ: {output_dir}")
 
+    # --- ネットワーク設定読み込み (無ければ自動生成) --------------------------------
+    print(f"[1] ネットワーク設定を読み込み中: {config_path}")
+    cfg = load_network_config(config_path)
+    lifetimes = {name: get_lifetime(cfg, name) for name in ("solar", "wind", "battery", "diesel")}
+    print(f"    耐用年数: {lifetimes}  (割引率={DISCOUNT_RATE})")
+    print(f"    スナップショット数: {len(cfg['timeseries'])} (8760h, 各1時間重み)")
+
     # --- LHS -----------------------------------------------------------------
-    X = latin_sample.sample(PROBLEM, N_LHS, seed=SEED)
-    print(f"[1] LHSサンプル生成: {X.shape}  (スナップショット数={len(PROFILES)})")
+    X = latin_sample.sample(PROBLEM, n_lhs, seed=SEED)
+    print(f"[2] LHSサンプル生成: {X.shape}")
 
     # --- PyPSA ----------------------------------------------------------------
-    print("[2] PyPSA最適化を実行中 ...")
+    print("[3] PyPSA最適化(8760h)を実行中 ...")
     rows = []
+    report_every = max(1, n_lhs // 8)
     for i, x in enumerate(X):
-        rows.append(run_pypsa(x))
-        if (i + 1) % 40 == 0:
-            print(f"    {i + 1}/{N_LHS} done  ({time.time() - t0:.0f}s)")
+        rows.append(run_pypsa(cfg, x, lifetimes))
+        if (i + 1) % report_every == 0 or (i + 1) == n_lhs:
+            print(f"    {i + 1}/{n_lhs} done  ({time.time() - t0:.0f}s)")
     res = pd.DataFrame(rows)
     df = pd.concat([pd.DataFrame(X, columns=NAMES), res], axis=1)
     df.index.name = "sample"
@@ -207,9 +342,12 @@ def main():
 
     ds = xr.Dataset(
         {c: ("sample", df[c].to_numpy()) for c in df.columns},
-        coords={"sample": np.arange(N_LHS)},
-        attrs={"title": "PyPSA LHS 320 results", "units_costs": "CAPEX USD/MW (overnight), diesel USD/MWh",
-               "total_cost_unit": "USD/year", "capacity_unit": "MW"},
+        coords={"sample": np.arange(n_lhs)},
+        attrs={
+            "title": "PyPSA LHS results",
+            "units_costs": "CAPEX USD/MW (overnight), diesel USD/MWh",
+            "total_cost_unit": "USD/year", "capacity_unit": "MW", "energy_unit": "MWh/year",
+        },
     )
     ds.to_netcdf(os.path.join(output_dir, "pypsa_lhs_320_results.nc"), engine="netcdf4")
     print("    保存: pypsa_lhs_320_results.csv / pypsa_lhs_320_results.nc")
@@ -217,7 +355,7 @@ def main():
     y = df["total_cost"].to_numpy()
 
     # --- PCEサロゲート -----------------------------------------------------------
-    print("[3] PCEサロゲート学習 (StandardScaler -> Poly(2) -> RidgeCV)")
+    print("[4] PCEサロゲート学習 (StandardScaler -> Poly(2) -> RidgeCV)")
     pce = Pipeline([
         ("scaler", StandardScaler()),
         ("poly", PolynomialFeatures(degree=2, include_bias=True)),
@@ -237,11 +375,11 @@ def main():
     print(f"    学習 RMSE = {rmse_train:,.1f}   CV RMSE = {rmse_cv:,.1f}  [USD/year]")
 
     # --- Sobol on surrogate ------------------------------------------------------
-    print(f"[4] サロゲート上でSobol解析 (N={N_SOBOL} -> {N_SOBOL * (2 * 4 + 2)}点)")
-    Xs = sobol_sample.sample(PROBLEM, N_SOBOL, calc_second_order=True, seed=SEED)
-    ts = time.time()
+    print(f"[5] サロゲート上でSobol解析 (N={n_sobol} -> {n_sobol * (2 * 4 + 2)}点)")
+    Xs = sobol_sample.sample(PROBLEM, n_sobol, calc_second_order=True, seed=SEED)
+    ts_sobol = time.time()
     Ys = pce.predict(Xs)
-    print(f"    サロゲート評価 {len(Xs)}点: {(time.time() - ts) * 1000:.1f} ms")
+    print(f"    サロゲート評価 {len(Xs)}点: {(time.time() - ts_sobol) * 1000:.1f} ms")
     Si = sobol_analyze.analyze(PROBLEM, Ys, calc_second_order=True, seed=SEED,
                                print_to_console=False)
     sens = pd.DataFrame({"S1": Si["S1"], "S1_conf": Si["S1_conf"],
