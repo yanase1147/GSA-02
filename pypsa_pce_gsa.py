@@ -149,11 +149,11 @@ def generate_sample_config(path):
     buses = pd.DataFrame({"bus_name": ["bus"], "v_nom": [0.4]})
     generators = pd.DataFrame([
         {"name": "solar", "bus": "bus", "carrier": "solar", "capex": 700000.0,
-         "marginal_cost": 0.0, "efficiency": 1.0, "lifetime": 25, "p_nom_extendable": True},
+         "marginal_cost": 0.0, "lifetime": 25, "p_nom_extendable": True},
         {"name": "wind", "bus": "bus", "carrier": "wind", "capex": 1100000.0,
-         "marginal_cost": 0.0, "efficiency": 1.0, "lifetime": 25, "p_nom_extendable": True},
+         "marginal_cost": 0.0, "lifetime": 25, "p_nom_extendable": True},
         {"name": "diesel", "bus": "bus", "carrier": "diesel", "capex": 800000.0,
-         "marginal_cost": 250.0, "efficiency": 0.40, "lifetime": 20, "p_nom_extendable": True},
+         "marginal_cost": 250.0, "lifetime": 20, "p_nom_extendable": True},
     ])
     storage_units = pd.DataFrame([
         {"name": "battery", "bus": "bus", "carrier": "battery", "capex": 600000.0,
@@ -188,6 +188,50 @@ _LINKS_COLUMNS = ["name", "bus0", "bus1", "carrier", "capex", "marginal_cost",
                    "efficiency", "lifetime", "p_nom_extendable"]
 
 
+def _get_or_default(row, col, default):
+    """row.get(col, default) と異なり、列は存在するがセルが空欄(NaN)の場合もdefaultを返す。"""
+    val = row.get(col, default)
+    return default if pd.isna(val) else val
+
+
+def _to_bool(value):
+    """Excel由来の値をboolへ変換する。"FALSE"/"0"等の文字列もFalseとして扱う。
+    値がNaN(空欄セル)の場合はここでは判定せず、_validate_required_columns 側で
+    事前にエラーとして検出する前提とする。"""
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return bool(value)
+
+
+_REQUIRED_COLS = {
+    "buses": ["bus_name"],
+    "generators": ["name", "bus", "carrier", "capex", "marginal_cost", "lifetime", "p_nom_extendable"],
+    "storage_units": ["name", "bus", "carrier", "capex", "max_hours",
+                       "efficiency_store", "efficiency_dispatch", "lifetime", "p_nom_extendable"],
+    "loads": ["name", "bus"],
+    "links": ["name", "bus0", "bus1", "capex", "lifetime", "p_nom_extendable"],
+    "uncertainty_params": ["param_name", "component_type", "component_name",
+                            "target_attribute", "lower_bound", "upper_bound"],
+}
+
+
+def _validate_required_columns(df, sheet_name):
+    """sheet_name の必須列について、列の欠落および空欄セル(NaN)を検出しエラーにする。
+    値をfloat()/bool()変換する前にここで弾くことで、空欄がNaNとして
+    サイレントにPyPSAへ渡ってしまう(または真偽値が意図せずTrueになる)事態を防ぐ。"""
+    cols = _REQUIRED_COLS[sheet_name]
+    missing_cols = [c for c in cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"{sheet_name} シートに必須列がありません: {missing_cols}")
+    for col in cols:
+        na_rows = df.index[df[col].isna()]
+        if len(na_rows):
+            excel_rows = [int(i) + 2 for i in na_rows]  # 0-index -> Excel行番号(ヘッダー行+1)
+            raise ValueError(
+                f"{sheet_name}.{col} に空欄セルがあります (Excel行: {excel_rows})"
+            )
+
+
 def load_network_config(path):
     if not path.exists():
         generate_sample_config(path)
@@ -213,6 +257,11 @@ def load_network_config(path):
     else:
         cfg["links"] = pd.DataFrame(columns=_LINKS_COLUMNS)
 
+    for sheet_name in ("buses", "generators", "storage_units", "loads"):
+        _validate_required_columns(cfg[sheet_name], sheet_name)
+    if not cfg["links"].empty:
+        _validate_required_columns(cfg["links"], "links")
+
     cfg["timeseries"]["timestamp"] = pd.to_datetime(cfg["timeseries"]["timestamp"])
     if len(cfg["timeseries"]) != N_HOURS:
         raise ValueError(
@@ -230,11 +279,7 @@ def load_network_config(path):
 
 def _validate_uncertainty_params(cfg):
     udf = cfg["uncertainty_params"]
-    required_cols = {"param_name", "component_type", "component_name",
-                      "target_attribute", "lower_bound", "upper_bound"}
-    missing_cols = required_cols - set(udf.columns)
-    if missing_cols:
-        raise ValueError(f"uncertainty_params シートに列が不足しています: {sorted(missing_cols)}")
+    _validate_required_columns(udf, "uncertainty_params")
     if udf.empty:
         raise ValueError("uncertainty_params シートに行がありません（最低1パラメータが必要です）")
     if udf["param_name"].duplicated().any():
@@ -326,7 +371,7 @@ def build_network(cfg):
     n.add("Carrier", sorted(carriers))
 
     for _, row in cfg["buses"].iterrows():
-        n.add("Bus", str(row["bus_name"]), v_nom=float(row.get("v_nom", 1.0)))
+        n.add("Bus", str(row["bus_name"]), v_nom=float(_get_or_default(row, "v_nom", 1.0)))
 
     for _, row in cfg["loads"].iterrows():
         name = str(row["name"])
@@ -337,13 +382,16 @@ def build_network(cfg):
 
     for _, row in cfg["generators"].iterrows():
         name = str(row["name"])
+        # 注: Generatorのefficiencyは(Linkと異なり)PyPSAのLOPFでは使われず
+        # 燃料費/CO2排出換算のロジックもこのスクリプトには無いため、意味を持たない。
+        # 誤解を避けるためGeneratorには渡さない(Link.efficiencyはp1=-p0*efficiencyの
+        # フロー計算に実際に使われるため引き続き渡す)。
         kwargs = dict(
             bus=str(row["bus"]),
             carrier=str(row["carrier"]),
-            p_nom_extendable=bool(row["p_nom_extendable"]),
+            p_nom_extendable=_to_bool(row["p_nom_extendable"]),
             capital_cost=annualized(float(row["capex"]), float(row["lifetime"])),
             marginal_cost=float(row["marginal_cost"]),
-            efficiency=float(row.get("efficiency", 1.0)),
         )
         pu_col = f"{name}_p_max_pu"  # 命名規則: generators.name + "_p_max_pu"
         if pu_col in ts.columns:
@@ -354,7 +402,7 @@ def build_network(cfg):
         n.add(
             "StorageUnit", str(row["name"]),
             bus=str(row["bus"]), carrier=str(row["carrier"]),
-            p_nom_extendable=bool(row["p_nom_extendable"]),
+            p_nom_extendable=_to_bool(row["p_nom_extendable"]),
             max_hours=float(row["max_hours"]),
             capital_cost=annualized(float(row["capex"]), float(row["lifetime"])),
             efficiency_store=float(row["efficiency_store"]),
@@ -366,11 +414,11 @@ def build_network(cfg):
         n.add(
             "Link", str(row["name"]),
             bus0=str(row["bus0"]), bus1=str(row["bus1"]),
-            carrier=str(row.get("carrier", "")),
-            p_nom_extendable=bool(row["p_nom_extendable"]),
+            carrier=str(_get_or_default(row, "carrier", "")),
+            p_nom_extendable=_to_bool(row["p_nom_extendable"]),
             capital_cost=annualized(float(row["capex"]), float(row["lifetime"])),
-            marginal_cost=float(row.get("marginal_cost", 0.0)),
-            efficiency=float(row.get("efficiency", 1.0)),
+            marginal_cost=float(_get_or_default(row, "marginal_cost", 0.0)),
+            efficiency=float(_get_or_default(row, "efficiency", 1.0)),
         )
     return n
 
@@ -470,14 +518,33 @@ def main():
     print("[3] PyPSA最適化(8760h)を実行中 ...")
     rows = []
     report_every = max(1, n_lhs // 8)
-    for i, x in enumerate(X):
-        rows.append(run_pypsa(cfg, x, udf, lifetimes))
-        if (i + 1) % report_every == 0 or (i + 1) == n_lhs:
-            print(f"    {i + 1}/{n_lhs} done  ({time.time() - t0:.0f}s)")
+    try:
+        for i, x in enumerate(X):
+            rows.append(run_pypsa(cfg, x, udf, lifetimes))
+            if (i + 1) % report_every == 0 or (i + 1) == n_lhs:
+                print(f"    {i + 1}/{n_lhs} done  ({time.time() - t0:.0f}s)")
+    except Exception:
+        # 失敗時、それまでに完了した分だけでも退避する(8760h LPは1点あたり高コストなため)。
+        # フォールバックはせず、失敗自体はここで揉み消さずに再送出する。
+        if rows:
+            partial_res = pd.DataFrame(rows)
+            partial_df = pd.concat(
+                [pd.DataFrame(X[:len(rows)], columns=names), partial_res], axis=1
+            )
+            partial_df.index.name = "sample"
+            partial_path = os.path.join(
+                output_dir, f"pypsa_lhs_{n_lhs}_results_partial_{len(rows)}.csv"
+            )
+            partial_df.to_csv(partial_path)
+            print(f"    [!] {len(rows)}/{n_lhs} 件の完了分を退避しました: {partial_path}",
+                  file=sys.stderr)
+        raise
     res = pd.DataFrame(rows)
     df = pd.concat([pd.DataFrame(X, columns=names), res], axis=1)
     df.index.name = "sample"
-    df.to_csv(os.path.join(output_dir, "pypsa_lhs_320_results.csv"))
+    lhs_csv_name = f"pypsa_lhs_{n_lhs}_results.csv"
+    lhs_nc_name = f"pypsa_lhs_{n_lhs}_results.nc"
+    df.to_csv(os.path.join(output_dir, lhs_csv_name))
 
     ds = xr.Dataset(
         {c: ("sample", df[c].to_numpy()) for c in df.columns},
@@ -488,8 +555,8 @@ def main():
             "total_cost_unit": "USD/year", "capacity_unit": "MW", "energy_unit": "MWh/year",
         },
     )
-    ds.to_netcdf(os.path.join(output_dir, "pypsa_lhs_320_results.nc"), engine="netcdf4")
-    print("    保存: pypsa_lhs_320_results.csv / pypsa_lhs_320_results.nc")
+    ds.to_netcdf(os.path.join(output_dir, lhs_nc_name), engine="netcdf4")
+    print(f"    保存: {lhs_csv_name} / {lhs_nc_name}")
 
     y = df["total_cost"].to_numpy()
 
@@ -497,7 +564,9 @@ def main():
     print("[4] PCEサロゲート学習 (StandardScaler -> Poly(2) -> RidgeCV)")
     pce = Pipeline([
         ("scaler", StandardScaler()),
-        ("poly", PolynomialFeatures(degree=2, include_bias=True)),
+        # RidgeCVがfit_intercept=True(既定)で自前の切片を推定するため、
+        # PolynomialFeatures側のバイアス列(定数項)は不要(二重の切片を避ける)。
+        ("poly", PolynomialFeatures(degree=2, include_bias=False)),
         ("ridge", RidgeCV(alphas=np.logspace(-4, 3, 30), cv=10)),
     ])
     pce.fit(X, y)
@@ -595,8 +664,8 @@ def main():
     print("\n" + "=" * 78)
     print(f"完了 ({time.time() - t0:.0f}s)")
     print(f"成果物の保存先: {output_dir}")
-    print("  - pypsa_lhs_320_results.csv")
-    print("  - pypsa_lhs_320_results.nc")
+    print(f"  - {lhs_csv_name}")
+    print(f"  - {lhs_nc_name}")
     print("  - sobol_s2_matrix.csv")
     print("  - pce_interaction_matrix.csv")
     print("  - pypsa_pce_gsa_results.png")

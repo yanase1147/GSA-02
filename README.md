@@ -67,7 +67,7 @@ GSA-02/
 | シート | 必須列 | 説明 |
 |---|---|---|
 | `buses` | `bus_name`, `v_nom` | ノード定義（既定は単一ノード `bus`） |
-| `generators` | `name`, `bus`, `carrier`, `capex`, `marginal_cost`, `efficiency`, `lifetime`, `p_nom_extendable` | 発電機の基本定義。行を追加するだけで新しい発電技術（水力・原子力・水素発電等）を組み込めます |
+| `generators` | `name`, `bus`, `carrier`, `capex`, `marginal_cost`, `lifetime`, `p_nom_extendable` | 発電機の基本定義。行を追加するだけで新しい発電技術（水力・原子力・水素発電等）を組み込めます |
 | `storage_units` | `name`, `bus`, `carrier`, `capex`, `max_hours`, `efficiency_store`, `efficiency_dispatch`, `lifetime`, `p_nom_extendable` | 蓄電池等の基本定義 |
 | `loads` | `name`, `bus` | 需要の基本定義（実データは `timeseries` の対応列） |
 | `timeseries` | `timestamp`, 各種`*_p_max_pu`, 各種`*_mw` | **8,760行**（1年・1時間刻み） |
@@ -101,7 +101,7 @@ GSA-02/
   決定論的な合成気象・負荷プロファイル、固定シード）を自動生成します。
 
 ### 拡張例: 新技術（原子力）の追加
-1. `generators` シートに1行追加: `name=nuclear, bus=bus, carrier=nuclear, capex=6000000, marginal_cost=15, efficiency=0.33, lifetime=40, p_nom_extendable=TRUE`
+1. `generators` シートに1行追加: `name=nuclear, bus=bus, carrier=nuclear, capex=6000000, marginal_cost=15, lifetime=40, p_nom_extendable=TRUE`
 2. `uncertainty_params` シートに1行追加: `param_name=nuclear_capex, component_type=generator, component_name=nuclear, target_attribute=capital_cost, lower_bound=4000000, upper_bound=8000000`
 3. `python pypsa_pce_gsa.py` を実行するだけで、5次元LHS/PCE/Sobol（基底数21）に自動的に拡張されます。
    出力CSVにも `nuclear_mw` / `nuclear_mwh` 列が自動的に追加されます。
