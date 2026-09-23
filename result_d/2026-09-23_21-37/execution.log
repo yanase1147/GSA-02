@@ -1,0 +1,86 @@
+==============================================================================
+ network_config.xlsx (代表値) -> PyPSA(8760h) -> 年間/月別ディスパッチ解析
+==============================================================================
+[0] 出力先フォルダ: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37
+    月別グラフ: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots
+
+[1] ネットワーク設定を読み込み中: C:\Users\yanas\Documents\PyPSA\GSA-02\network_config.xlsx
+[2] 代表値(中央値)ネットワークを構築中 ...
+
+[代表値コスト] 適用コスト (中央値/ベースライン)
+    Solar    CAPEX =      49,666.72 $/MW/year
+    Wind     CAPEX =      79,821.51 $/MW/year
+    Battery  CAPEX =      67,695.25 $/MW/year
+    Diesel   OPEX  =         250.00 $/MWh
+
+[3] PyPSA最適化(8760h)を実行中 ...
+Writing constraints.:   0%|[38;2;128;191;255m          [0m| 0/12 [00:00<?, ?it/s]Writing constraints.:  58%|[38;2;128;191;255m#####8    [0m| 7/12 [00:00<00:00, 68.17it/s]Writing constraints.: 100%|[38;2;128;191;255m##########[0m| 12/12 [00:00<00:00, 78.54it/s]
+Writing continuous variables.:   0%|[38;2;128;191;255m          [0m| 0/6 [00:00<?, ?it/s]Writing continuous variables.: 100%|[38;2;128;191;255m##########[0m| 6/6 [00:00<00:00, 314.42it/s]
+INFO:pypsa.optimization.optimize:The shadow-prices of the constraints Generator-ext-p-lower, Generator-ext-p-upper, StorageUnit-ext-p_dispatch-lower, StorageUnit-ext-p_dispatch-upper, StorageUnit-ext-p_store-lower, StorageUnit-ext-p_store-upper, StorageUnit-ext-state_of_charge-lower, StorageUnit-ext-state_of_charge-upper, StorageUnit-energy_balance were not assigned to the network.
+
+    最適化ステータス: status=ok, condition=optimal
+
+[4] 結果を集計中 ...
+
+--- 最適容量 [MW] / 容量比率 [%] ---
+    Solar   :       0.38 MW  ( 67.0%)
+    Wind    :       0.04 MW  (  7.0%)
+    Battery :       0.13 MW  ( 23.4%)
+    Diesel  :       0.01 MW  (  2.6%)
+    合計容量:       0.57 MW
+
+--- 年間発電量 [MWh] / 年間発電量比率 [%] (対 年間総需要) ---
+    Solar   :        366.7 MWh  ( 91.3%)
+    Wind    :         36.4 MWh  (  9.1%)
+    Battery :        135.1 MWh  ( 33.6%)
+    Diesel  :         13.0 MWh  (  3.2%)
+    年間総需要:              401.5 MWh
+    (参考)Battery充電量:        149.7 MWh
+
+[5] 年間サマリー:
+電源/リソース   適用コスト(代表値)     コスト単位  最適容量[MW]   容量比率[%]  年間発電量[MWh]  年間発電量比率[%]
+  Solar 49666.720109 $/MW/year  0.381581 67.049449  366.706660   91.334162
+   Wind 79821.514462 $/MW/year  0.039675  6.971455   36.421289    9.071305
+Battery 67695.246012 $/MW/year  0.133255 23.414944  135.059254   33.638668
+ Diesel   250.000000     $/MWh  0.014593  2.564152   12.962940    3.228628
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\annual_summary_metrics.csv
+
+    月別サマリー:
+  月  Solar[MWh]  Wind[MWh]  Diesel[MWh]  Battery放電[MWh]  Battery充電[MWh]   需要[MWh]   再エネ比率[%]
+Jan   31.156396   3.267474     0.511190       11.698975       12.980587 33.653448 102.289283
+Feb   29.354939   1.666027     0.022904       10.784518       11.858994 29.969395 103.508818
+Mar   35.290381   0.742938     0.430941       12.870531       14.266450 35.068341 102.751707
+Apr   32.612146   0.421465     1.618801       12.306942       13.748338 33.211016  99.465826
+May   30.691482   2.369338     1.414490       11.513074       12.607768 33.380615  99.041973
+Jun   27.151917   4.952746     2.215945        9.412542       10.381790 33.351359  96.261931
+Jul   30.149630   3.996687     0.922643       11.224269       12.534843 33.758386 101.149138
+Aug   26.119074   8.908926     1.313279        9.372286       10.330233 35.383332  98.995765
+Sep   29.963503   3.675451     1.110875       11.261016       12.598788 33.412057 100.679089
+Oct   31.496729   1.054278     2.409053       11.603888       12.858610 33.705338  96.575228
+Nov   30.942737   2.137605     0.933138       11.728089       13.063808 32.677761 101.231972
+Dec   31.777724   3.228354     0.059681       11.283124       12.419933 33.928951 103.174655
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_summary_metrics.csv
+
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\annual_dispatch_data.csv
+
+[6] 年間ディスパッチグラフを作成中 ...
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\annual_dispatch_balance.png
+
+[7] 月別ディスパッチグラフ(12枚)を作成中 ...
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots\01_Jan.png
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots\02_Feb.png
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots\03_Mar.png
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots\04_Apr.png
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots\05_May.png
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots\06_Jun.png
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots\07_Jul.png
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots\08_Aug.png
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots\09_Sep.png
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots\10_Oct.png
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots\11_Nov.png
+    保存: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37\monthly_plots\12_Dec.png
+
+==============================================================================
+完了 (20s)
+成果物の保存先: C:\Users\yanas\Documents\PyPSA\GSA-02\result_d\2026-09-23_21-37
+==============================================================================
