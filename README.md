@@ -47,17 +47,26 @@ network_config.xlsx → LHS(320点) → PyPSA(LP, 8760h) → PCEサロゲート�
 ## ディレクトリ構成
 ```
 GSA-02/
-├── pypsa_pce_gsa.py             # 本体スクリプト
+├── pypsa_pce_gsa.py             # 本体スクリプト (LHS → PyPSA → PCE → Sobol GSA)
+├── plot_annual_dispatch.py      # 代表値での年間/月別ディスパッチ解析・作図スクリプト
 ├── network_config.xlsx          # ネットワーク設定 + 8760h時系列（無ければ自動生成）
 ├── requirements.txt             # pip用
 ├── environment.yml              # conda用
 ├── README.md
-└── results/
-    └── YYYY-MM-DD_HH-MM/        # 実行ごとにタイムスタンプ付きフォルダを自動生成
-        ├── pypsa_lhs_320_results.csv / .nc
-        ├── sobol_s2_matrix.csv
-        ├── pce_interaction_matrix.csv
-        └── pypsa_pce_gsa_results.png
+├── results/
+│   └── YYYY-MM-DD_HH-MM/        # GSA実行ごとにタイムスタンプ付きフォルダを自動生成
+│       ├── pypsa_lhs_320_results.csv / .nc
+│       ├── sobol_s2_matrix.csv
+│       ├── pce_interaction_matrix.csv
+│       └── pypsa_pce_gsa_results.png
+└── result_d/
+    └── YYYY-MM-DD_HH-MM/        # plot_annual_dispatch.py 実行ごとに自動生成
+        ├── annual_summary_metrics.csv
+        ├── monthly_summary_metrics.csv
+        ├── annual_dispatch_data.csv
+        ├── annual_dispatch_balance.png
+        ├── execution.log
+        └── monthly_plots/01_Jan.png 〜 12_Dec.png
 ```
 
 ## `network_config.xlsx` のシート構成と編集方法
@@ -138,6 +147,35 @@ python pypsa_pce_gsa.py --config network_config.xlsx --n-lhs 320 --n-sobol 1024
 | `sobol_s2_matrix.csv` | Sobol 2次感度指標 Sij のn×n対称行列（対角=0, n=不確実性パラメータ数） |
 | `pce_interaction_matrix.csv` | PCE交差項係数 Cij のn×n対称行列（対角=2乗項係数 Cii） |
 | `pypsa_pce_gsa_results.png` | 左: S1/ST棒グラフ、右: PyPSA vs PCE 1:1プロット（R², CV R²） |
+
+## 代表値での年間ディスパッチ解析 (`plot_annual_dispatch.py`)
+GSAとは別に、不確実性パラメータの**代表値（`lower_bound` と `upper_bound` の中央値）**で8,760時間の最適化を
+1回だけ実行し、年間・月別の需給バランスを可視化します。ネットワーク構築・CRF年換算は `pypsa_pce_gsa.py` の
+関数をそのまま再利用しています（電源名は `solar` / `wind` / `battery` / `diesel` を想定）。
+
+```bash
+python plot_annual_dispatch.py
+python plot_annual_dispatch.py --config network_config.xlsx
+```
+所要時間の目安は数十秒です（LP 1回のみ）。
+
+### 出力ファイル (`result_d/YYYY-MM-DD_HH-MM/`)
+| ファイル | 内容 |
+|---|---|
+| `annual_summary_metrics.csv` | 電源別の適用コスト（代表値, CAPEXは`$/MW/year`・OPEXは`$/MWh`）、最適容量[MW]、容量比率[%]、年間発電量[MWh]、年間発電量比率[%]（蓄電池は年間放電量） |
+| `monthly_summary_metrics.csv` | 1〜12月ごとの Solar/Wind/Diesel 発電量、蓄電池充放電量、需要[MWh]、再エネ比率[%] |
+| `annual_dispatch_data.csv` | 8,760時間全時系列（各電源出力・蓄電池充放電・SOC・需要） |
+| `annual_dispatch_balance.png` | 年間需給バランス（積層エリア＋需要線）と蓄電池SOC (16×9, 300dpi)。最適容量・構成比のインセット付き |
+| `monthly_plots/01_Jan.png`〜`12_Dec.png` | 月別の需給バランスとSOC (14×8, 300dpi, 日単位の目盛り) |
+| `execution.log` | コンソール出力の記録（PyPSAのログ・進捗バーを含む） |
+
+- 配色は全図共通: Solar `#F1C40F` / Wind `#2980B9` / Battery Discharge `#2ECC71` / Battery Charge `#27AE60` /
+  Diesel `#7F8C8D` / Load `#E74C3C`。グラフ内表記は英語で統一しています。
+- 「年間発電量比率」「再エネ比率」は、年間（月別）総需要に対する割合です。蓄電池の充放電損失や出力の
+  過剰分により、合計が100%を超えることがあります。
+- `execution.log` には、HiGHSのネイティブなソルバーバナー（反復ログ）は保存されない場合があります。
+  端末のOSレベル出力を付け替える方式は、Windowsの対話型コンソールでフリーズする恐れがあったため採用していません
+  （ソルバーログは通常どおりコンソールに表示されます）。
 
 ## 結果の解釈ルール
 - **S1**: 単独でのコスト分散への寄与割合。**ST**: 他パラメータとの交互作用を含む総寄与。
