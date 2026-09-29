@@ -5,6 +5,8 @@ PyPSA の 8,760時間最適化を1回実行し、以下を出力する。
 
   - 年間集計指標(適用コスト・最適容量・容量比率・年間発電量・発電量比率)
   - 年間8,760時間の需給バランス/SOC推移グラフ
+  - 最適設備容量の円グラフ・年間発電電力量の円グラフ
+  - 季節別代表週(Weekly Seasonal Dispatch)の需給バランス/SOC推移グラフ (4枚: 冬春夏秋)
   - 月別(1〜12月)の需給バランス/SOC推移グラフ (12枚)
   - 年間/月別サマリーCSV, 全時系列CSV, 実行ログ
 
@@ -93,9 +95,11 @@ def make_output_dirs():
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
     output_dir = os.path.join(BASE_DIR, "result_d", timestamp)
     monthly_dir = os.path.join(output_dir, "monthly_plots")
+    weekly_dir = os.path.join(output_dir, "weekly_seasonal_plots")
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(monthly_dir, exist_ok=True)
-    return output_dir, monthly_dir
+    os.makedirs(weekly_dir, exist_ok=True)
+    return output_dir, monthly_dir, weekly_dir
 
 
 # ----------------------------------------------------------------------------
@@ -386,6 +390,135 @@ def plot_monthly_dispatch(df, month, caps, cap_ratio, out_path):
 
 
 # ----------------------------------------------------------------------------
+# 季節別代表週(Weekly Seasonal Dispatch)グラフ
+# ----------------------------------------------------------------------------
+# 各季節(気象学的四季, 北半球想定)を代表する暦週を、季節の中央付近の月の15日を起点に
+# 7日間(168時間)切り出して表示する(平均化はせず、実データの物理的整合性を保つ)。
+SEASON_ANCHORS = [
+    ("Winter", 1, 15),
+    ("Spring", 4, 15),
+    ("Summer", 7, 15),
+    ("Autumn", 10, 15),
+]
+
+
+def plot_seasonal_dispatch(df, season_name, anchor_month, anchor_day, caps, cap_ratio, out_path):
+    year = int(df.index[0].year)
+    start = pd.Timestamp(year=year, month=anchor_month, day=anchor_day)
+    end = start + pd.Timedelta(days=7)
+    sub = df[(df.index >= start) & (df.index < end)]
+    idx = sub.index
+
+    # Power(左軸)とBattery SOC(右軸)を1つのグラフに重ねる2軸(twin-axis)構成。
+    # 縦:横 = 1:5 の横長レイアウト。
+    fig, ax1 = plt.subplots(figsize=(20, 4), dpi=300)
+    ax2 = ax1.twinx()
+
+    solar = sub["solar_mw"].to_numpy()
+    wind = sub["wind_mw"].to_numpy()
+    diesel = sub["diesel_mw"].to_numpy()
+    batt_dis = sub["battery_discharge_mw"].to_numpy()
+    batt_chg = -sub["battery_charge_mw"].to_numpy()
+
+    ax1.stackplot(
+        idx, solar, wind, diesel, batt_dis,
+        colors=[COLORS["solar"], COLORS["wind"], COLORS["diesel"], COLORS["battery_discharge"]],
+        labels=["Solar", "Wind", "Diesel", "Battery Discharge"],
+    )
+    ax1.stackplot(idx, batt_chg, colors=[COLORS["battery_charge"]], labels=["Battery Charge"])
+    ax1.plot(idx, sub["load_mw"], color=COLORS["load"], lw=1.0, label="Load")
+    ax1.axhline(0, color="black", lw=0.6)
+    ax1.set_ylabel("Power [MW]")
+    ax1.set_xlabel("Date")
+    end_label = (end - pd.Timedelta(hours=1))
+    ax1.set_title(
+        f"Weekly Seasonal Dispatch - {season_name} "
+        f"(Representative Week: {start:%Y-%m-%d} to {end_label:%Y-%m-%d})"
+    )
+    ax1.grid(alpha=0.3)
+    ax1.xaxis.set_major_locator(mdates.DayLocator())
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+
+    soc = sub["battery_soc_mwh"]
+    ax2.plot(idx, soc, color=COLORS["battery_charge"], lw=1.2, ls="--", label="Battery SOC")
+    ax2.set_ylabel("Battery SOC [MWh]")
+    ax2.set_ylim(bottom=0)
+
+    handles1, labels1 = ax1.get_legend_handles_labels()
+    handles2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(handles1 + handles2, labels1 + labels2, loc="upper right", ncol=4, fontsize=8)
+
+    w = sub["weight_h"]
+    demand_mwh = float((sub["load_mw"] * w).sum())
+    weekly_gen = {
+        "Solar": float((sub["solar_mw"] * w).sum()),
+        "Wind": float((sub["wind_mw"] * w).sum()),
+        "Battery": float((sub["battery_discharge_mw"] * w).sum()),
+        "Diesel": float((sub["diesel_mw"] * w).sum()),
+    }
+    lines = [_capacity_mix_text(caps, cap_ratio, header="Optimal capacity (annual):"),
+             "Weekly generation:"]
+    for name in RESOURCES:
+        val = weekly_gen.get(name, 0.0)
+        pct = (val / demand_mwh * 100.0) if demand_mwh > 0 else 0.0
+        lines.append(f"  {name}: {val:,.1f} MWh ({pct:.1f}%)")
+    ax1.text(
+        0.01, 0.98, "\n".join(lines), transform=ax1.transAxes, va="top", ha="left",
+        fontsize=7, bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.85),
+    )
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close("all")
+
+
+# ----------------------------------------------------------------------------
+# 円グラフ (最適設備容量 / 年間発電電力量)
+# ----------------------------------------------------------------------------
+PIE_COLORS = {
+    "Solar": COLORS["solar"],
+    "Wind": COLORS["wind"],
+    "Battery": COLORS["battery_discharge"],
+    "Diesel": COLORS["diesel"],
+}
+# 円グラフは発電/供給源のみを対象とし、蓄電池(エネルギーの融通であり一次供給源ではない)は除外する。
+PIE_RESOURCES = ["Solar", "Wind", "Diesel"]
+
+
+def _plot_pie(values, unit_label, title, out_path):
+    labels = [name for name in PIE_RESOURCES if values.get(name, 0.0) > 0]
+    sizes = [values[name] for name in labels]
+    colors = [PIE_COLORS[name] for name in labels]
+
+    fig, ax = plt.subplots(figsize=(8, 8), dpi=300)
+    wedges, _texts, autotexts = ax.pie(
+        sizes, colors=colors, autopct="%1.1f%%", startangle=90, counterclock=False,
+        wedgeprops=dict(edgecolor="white", linewidth=1.5), textprops=dict(fontsize=11),
+        pctdistance=0.75,
+    )
+    for at in autotexts:
+        at.set_color("white")
+        at.set_fontweight("bold")
+    ax.set_title(title, fontsize=13)
+    ax.axis("equal")
+
+    legend_labels = [f"{name}: {values[name]:,.2f} {unit_label}" for name in labels]
+    ax.legend(wedges, legend_labels, loc="upper left", bbox_to_anchor=(-0.05, 1.05), fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close("all")
+
+
+def plot_capacity_pie(caps, out_path):
+    _plot_pie(caps, "MW", "Optimal Capacity Mix [MW]", out_path)
+
+
+def plot_generation_pie(gen, out_path):
+    _plot_pie(gen, "MWh", "Annual Generation Mix [MWh]", out_path)
+
+
+# ----------------------------------------------------------------------------
 # メイン
 # ----------------------------------------------------------------------------
 def parse_args():
@@ -399,7 +532,7 @@ def parse_args():
 def main():
     args = parse_args()
     t0 = time.time()
-    output_dir, monthly_dir = make_output_dirs()
+    output_dir, monthly_dir, weekly_dir = make_output_dirs()
 
     log_path = os.path.join(output_dir, "execution.log")
     log_file = open(log_path, "w", encoding="utf-8")
@@ -413,6 +546,7 @@ def main():
         print("=" * 78)
         print(f"[0] 出力先フォルダ: {output_dir}")
         print(f"    月別グラフ: {monthly_dir}")
+        print(f"    季節別代表週グラフ: {weekly_dir}")
 
         print(f"\n[1] ネットワーク設定を読み込み中: {args.config}")
         cfg = load_network_config(Path(args.config))
@@ -465,7 +599,22 @@ def main():
         plot_annual_dispatch(df, caps, cap_ratio, gen_ratio, annual_png_path)
         print(f"    保存: {annual_png_path}")
 
-        print("\n[7] 月別ディスパッチグラフ(12枚)を作成中 ...")
+        capacity_pie_path = os.path.join(output_dir, "optimal_capacity_pie.png")
+        plot_capacity_pie(caps, capacity_pie_path)
+        print(f"    保存: {capacity_pie_path}")
+
+        generation_pie_path = os.path.join(output_dir, "annual_generation_pie.png")
+        plot_generation_pie(gen, generation_pie_path)
+        print(f"    保存: {generation_pie_path}")
+
+        print("\n[7] 季節別代表週(Weekly Seasonal Dispatch)グラフ(4枚)を作成中 ...")
+        for i, (season_name, anchor_month, anchor_day) in enumerate(SEASON_ANCHORS, start=1):
+            fname = f"{i:02d}_{season_name}.png"
+            fpath = os.path.join(weekly_dir, fname)
+            plot_seasonal_dispatch(df, season_name, anchor_month, anchor_day, caps, cap_ratio, fpath)
+            print(f"    保存: {fpath}")
+
+        print("\n[8] 月別ディスパッチグラフ(12枚)を作成中 ...")
         for m in range(1, 13):
             fname = f"{m:02d}_{MONTH_NAMES[m - 1]}.png"
             fpath = os.path.join(monthly_dir, fname)

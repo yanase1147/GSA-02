@@ -65,7 +65,10 @@ GSA-02/
         ├── monthly_summary_metrics.csv
         ├── annual_dispatch_data.csv
         ├── annual_dispatch_balance.png
+        ├── optimal_capacity_pie.png
+        ├── annual_generation_pie.png
         ├── execution.log
+        ├── weekly_seasonal_plots/01_Winter.png 〜 04_Autumn.png
         └── monthly_plots/01_Jan.png 〜 12_Dec.png
 ```
 
@@ -166,6 +169,9 @@ python plot_annual_dispatch.py --config network_config.xlsx
 | `monthly_summary_metrics.csv` | 1〜12月ごとの Solar/Wind/Diesel 発電量、蓄電池充放電量、需要[MWh]、再エネ比率[%] |
 | `annual_dispatch_data.csv` | 8,760時間全時系列（各電源出力・蓄電池充放電・SOC・需要） |
 | `annual_dispatch_balance.png` | 年間需給バランス（積層エリア＋需要線）と蓄電池SOC (16×9, 300dpi)。最適容量・構成比のインセット付き |
+| `optimal_capacity_pie.png` | 最適設備容量[MW]の構成比 円グラフ (8×8, 300dpi、Solar/Wind/Dieselのみ。蓄電池はエネルギー貯蔵であり一次供給源ではないため除外) |
+| `annual_generation_pie.png` | 年間発電電力量[MWh]の構成比 円グラフ (8×8, 300dpi、Solar/Wind/Dieselのみ。蓄電池は除外) |
+| `weekly_seasonal_plots/01_Winter.png`〜`04_Autumn.png` | 季節別代表週(Weekly Seasonal Dispatch)の需給バランス。Power[MW](左軸)とBattery SOC[MWh](右軸)を1枚に重ねた2軸グラフ (縦横比1:5, 20×4, 300dpi)。各季節(気象学的四季, 北半球想定)の中央付近の月の15日を起点に実際の暦週(168時間)をそのまま表示(平均化なし) |
 | `monthly_plots/01_Jan.png`〜`12_Dec.png` | 月別の需給バランスとSOC (14×8, 300dpi, 日単位の目盛り) |
 | `execution.log` | コンソール出力の記録（PyPSAのログ・進捗バーを含む） |
 

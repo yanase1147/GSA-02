@@ -65,9 +65,9 @@ import xarray as xr
 from SALib.analyze import sobol as sobol_analyze
 from SALib.sample import latin as latin_sample
 from SALib.sample import sobol as sobol_sample
-from sklearn.linear_model import RidgeCV
+from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.metrics import mean_squared_error, r2_score
-from sklearn.model_selection import KFold, cross_val_predict
+from sklearn.model_selection import KFold, cross_val_predict, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 
@@ -82,6 +82,7 @@ N_LHS = 320
 N_SOBOL = 1024
 N_HOURS = 8760
 DISCOUNT_RATE = 0.05  # 割引率 (CAPEXの年換算 CRF 計算用, 全電源共通)
+PCE_ALPHAS = np.logspace(-4, 3, 30)  # RidgeCVの探索グリッド (CV誤差曲線/係数収縮パスと共有)
 
 # component_type(uncertainty_params) -> PyPSA Network属性名
 COMPONENT_ATTR = {"generator": "generators", "storage_unit": "storage_units", "link": "links"}
@@ -567,7 +568,7 @@ def main():
         # RidgeCVがfit_intercept=True(既定)で自前の切片を推定するため、
         # PolynomialFeatures側のバイアス列(定数項)は不要(二重の切片を避ける)。
         ("poly", PolynomialFeatures(degree=2, include_bias=False)),
-        ("ridge", RidgeCV(alphas=np.logspace(-4, 3, 30), cv=10)),
+        ("ridge", RidgeCV(alphas=PCE_ALPHAS, cv=10)),
     ])
     pce.fit(X, y)
     y_fit = pce.predict(X)
@@ -581,6 +582,87 @@ def main():
     print(f"    次元数 = {num_vars},  基底数 = {n_basis},  最適alpha = {pce.named_steps['ridge'].alpha_:.4g}")
     print(f"    学習 R^2 = {r2_train:.5f}   CV(10-fold) R^2 = {r2_cv:.5f}")
     print(f"    学習 RMSE = {rmse_train:,.1f}   CV RMSE = {rmse_cv:,.1f}  [USD/year]")
+
+    # --- Cross-Validation誤差曲線 / 係数収縮パス (L2正則化) -----------------------
+    print("[4b] Cross-Validation誤差曲線 / 係数収縮パスを計算中 "
+          f"({len(PCE_ALPHAS)}alpha x 10-fold)")
+    poly = pce.named_steps["poly"]
+    best_alpha = float(pce.named_steps["ridge"].alpha_)
+
+    # 特徴量名を実際のパラメータ名に置換した読みやすい凡例ラベルを作成 (x0 -> names[0] 等)。
+    fnames = poly.get_feature_names_out([f"x{i}" for i in range(num_vars)])
+    name_map = {f"x{i}": names[i] for i in range(num_vars)}
+
+    def _pretty_fname(fname):
+        pretty = []
+        for token in fname.split(" "):
+            if "^" in token:
+                base, power = token.split("^")
+                pretty.append(f"{name_map[base]}^{power}")
+            else:
+                pretty.append(name_map[token])
+        return " × ".join(pretty)
+
+    fnames_pretty = [_pretty_fname(f) for f in fnames]
+
+    # CV誤差曲線: alphaグリッドの各点についてRidge(alpha)をpce同様の10-foldで評価。
+    cv_rmse_mean = np.empty(len(PCE_ALPHAS))
+    cv_rmse_std = np.empty(len(PCE_ALPHAS))
+    for i, a in enumerate(PCE_ALPHAS):
+        pipe_a = Pipeline([
+            ("scaler", StandardScaler()),
+            ("poly", PolynomialFeatures(degree=2, include_bias=False)),
+            ("ridge", Ridge(alpha=a)),
+        ])
+        scores = cross_val_score(pipe_a, X, y, cv=kf, scoring="neg_root_mean_squared_error")
+        cv_rmse_mean[i] = -scores.mean()
+        cv_rmse_std[i] = scores.std()
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.errorbar(PCE_ALPHAS, cv_rmse_mean, yerr=cv_rmse_std, fmt="-o", ms=4, capsize=3,
+                color="#4c72b0", ecolor="#4c72b0", alpha=0.9,
+                label="CV RMSE (mean ± std, 10-fold)")
+    ax.axvline(best_alpha, color="#dd8452", ls="--", lw=1.5,
+               label=f"Selected α (RidgeCV) = {best_alpha:.4g}")
+    ax.set_xscale("log")
+    ax.set_xlabel("Regularization strength α (log scale)")
+    ax.set_ylabel("Cross-validated RMSE [USD/year]")
+    ax.set_title("Cross-Validation Error Curve (Ridge, 10-fold)")
+    ax.legend()
+    ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "cv_error_curve.png"), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    # 係数収縮パス: pceと同じ標準化+多項式展開後の特徴量に対し、alphaグリッドで
+    # Ridgeを全データ再学習し、各基底関数の係数がalpha増加とともに0へ収縮する様子を可視化。
+    Xt = poly.transform(pce.named_steps["scaler"].transform(X))
+    coef_path = np.empty((len(PCE_ALPHAS), n_basis))
+    for i, a in enumerate(PCE_ALPHAS):
+        ridge_a = Ridge(alpha=a)
+        ridge_a.fit(Xt, y)
+        coef_path[i, :] = ridge_a.coef_
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    cmap = plt.get_cmap("tab20" if n_basis > 10 else "tab10")
+    for j in range(n_basis):
+        ax.plot(PCE_ALPHAS, coef_path[:, j], color=cmap(j % cmap.N), lw=1.4,
+                label=fnames_pretty[j])
+    ax.axvline(best_alpha, color="black", ls="--", lw=1.2, alpha=0.7,
+               label=f"Selected α (RidgeCV) = {best_alpha:.4g}")
+    ax.axhline(0, color="gray", lw=0.8)
+    ax.set_xscale("log")
+    ax.set_xlabel("Regularization strength α (log scale)")
+    ax.set_ylabel("Ridge coefficient (standardized input space) [USD/year]")
+    ax.set_title("Coefficient Shrinkage Path (L2 Regularization)")
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8,
+              ncol=1 if n_basis <= 20 else 2)
+    ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "coefficient_shrinkage_path.png"), dpi=200,
+                bbox_inches="tight")
+    plt.close(fig)
+    print(f"    保存: cv_error_curve.png, coefficient_shrinkage_path.png")
 
     # --- Sobol on surrogate ------------------------------------------------------
     print(f"[5] サロゲート上でSobol解析 (N={n_sobol} -> {n_sobol * (2 * num_vars + 2)}点)")
@@ -603,9 +685,8 @@ def main():
     s2_df.to_csv(os.path.join(output_dir, "sobol_s2_matrix.csv"))
 
     # --- Cij -------------------------------------------------------------------
-    poly = pce.named_steps["poly"]
+    # poly/fnames は [4b] で既に算出済み(再計算不要)。
     coef = pce.named_steps["ridge"].coef_
-    fnames = poly.get_feature_names_out([f"x{i}" for i in range(num_vars)])
     cij = np.zeros((num_vars, num_vars))
     for fname, c in zip(fnames, coef):
         if "^2" in fname:  # 対角: 2乗項 Cii
@@ -669,6 +750,8 @@ def main():
     print("  - sobol_s2_matrix.csv")
     print("  - pce_interaction_matrix.csv")
     print("  - pypsa_pce_gsa_results.png")
+    print("  - cv_error_curve.png")
+    print("  - coefficient_shrinkage_path.png")
     print("=" * 78)
 
 
