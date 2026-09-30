@@ -6,7 +6,7 @@ PyPSA の 8,760時間最適化を1回実行し、以下を出力する。
   - 年間集計指標(適用コスト・最適容量・容量比率・年間発電量・発電量比率)
   - 年間8,760時間の需給バランス/SOC推移グラフ
   - 最適設備容量の円グラフ・年間発電電力量の円グラフ
-  - 季節別代表週(Weekly Seasonal Dispatch)の需給バランス/SOC推移グラフ (4枚: 冬春夏秋)
+  - 季節別代表週(Weekly Seasonal Dispatch)の需給バランス/SOC推移グラフ (3枚: 1月/6月/8月)
   - 月別(1〜12月)の需給バランス/SOC推移グラフ (12枚)
   - 年間/月別サマリーCSV, 全時系列CSV, 実行ログ
 
@@ -64,6 +64,7 @@ RESOURCES = ["Solar", "Wind", "Battery", "Diesel"]
 # ----------------------------------------------------------------------------
 COLORS = {
     "solar": "#F1C40F",
+    "solar_curtailed": "#FAD7A0",
     "wind": "#2980B9",
     "battery_discharge": "#2ECC71",
     "battery_charge": "#27AE60",
@@ -163,6 +164,17 @@ def compute_dispatch_frame(n):
     df["solar_mw"] = n.generators_t.p["solar"] if "solar" in n.generators.index else 0.0
     df["wind_mw"] = n.generators_t.p["wind"] if "wind" in n.generators.index else 0.0
     df["diesel_mw"] = n.generators_t.p["diesel"] if "diesel" in n.generators.index else 0.0
+
+    if "solar" in n.generators.index:
+        # p_max_pu(定数/時系列いずれも)を密行列化し、抑制がなければ出せたはずの
+        # 潜在発電量[MW] = p_max_pu x p_nom_opt を求め、実発電量との差分を抑制量とする。
+        solar_p_max_pu = n.get_switchable_as_dense("Generator", "p_max_pu")["solar"]
+        solar_potential_mw = solar_p_max_pu.to_numpy() * n.generators.at["solar", "p_nom_opt"]
+        df["solar_potential_mw"] = solar_potential_mw
+        df["solar_curtailed_mw"] = (df["solar_potential_mw"] - df["solar_mw"]).clip(lower=0)
+    else:
+        df["solar_potential_mw"] = 0.0
+        df["solar_curtailed_mw"] = 0.0
 
     if "battery" in n.storage_units.index:
         batt_p = n.storage_units_t.p["battery"]
@@ -392,13 +404,12 @@ def plot_monthly_dispatch(df, month, caps, cap_ratio, out_path):
 # ----------------------------------------------------------------------------
 # 季節別代表週(Weekly Seasonal Dispatch)グラフ
 # ----------------------------------------------------------------------------
-# 各季節(気象学的四季, 北半球想定)を代表する暦週を、季節の中央付近の月の15日を起点に
-# 7日間(168時間)切り出して表示する(平均化はせず、実データの物理的整合性を保つ)。
+# 指定月(1月/6月/8月)の15日を起点に7日間(168時間)切り出して表示する
+# (平均化はせず、実データの物理的整合性を保つ)。
 SEASON_ANCHORS = [
-    ("Winter", 1, 15),
-    ("Spring", 4, 15),
-    ("Summer", 7, 15),
-    ("Autumn", 10, 15),
+    ("January", 1, 15),
+    ("June", 6, 15),
+    ("August", 8, 15),
 ]
 
 
@@ -415,15 +426,18 @@ def plot_seasonal_dispatch(df, season_name, anchor_month, anchor_day, caps, cap_
     ax2 = ax1.twinx()
 
     solar = sub["solar_mw"].to_numpy()
+    solar_curt = sub["solar_curtailed_mw"].to_numpy()
     wind = sub["wind_mw"].to_numpy()
     diesel = sub["diesel_mw"].to_numpy()
     batt_dis = sub["battery_discharge_mw"].to_numpy()
     batt_chg = -sub["battery_charge_mw"].to_numpy()
 
+    # 抑制量は実発電(Solar)の直上に積み上げ、「抑制がなければここまで出せた」ことを示す。
     ax1.stackplot(
-        idx, solar, wind, diesel, batt_dis,
-        colors=[COLORS["solar"], COLORS["wind"], COLORS["diesel"], COLORS["battery_discharge"]],
-        labels=["Solar", "Wind", "Diesel", "Battery Discharge"],
+        idx, solar, solar_curt, wind, diesel, batt_dis,
+        colors=[COLORS["solar"], COLORS["solar_curtailed"], COLORS["wind"],
+                COLORS["diesel"], COLORS["battery_discharge"]],
+        labels=["Solar", "Solar Curtailed", "Wind", "Diesel", "Battery Discharge"],
     )
     ax1.stackplot(idx, batt_chg, colors=[COLORS["battery_charge"]], labels=["Battery Charge"])
     ax1.plot(idx, sub["load_mw"], color=COLORS["load"], lw=1.0, label="Load")
@@ -462,6 +476,12 @@ def plot_seasonal_dispatch(df, season_name, anchor_month, anchor_day, caps, cap_
         val = weekly_gen.get(name, 0.0)
         pct = (val / demand_mwh * 100.0) if demand_mwh > 0 else 0.0
         lines.append(f"  {name}: {val:,.1f} MWh ({pct:.1f}%)")
+
+    solar_potential_mwh = float((sub["solar_potential_mw"] * w).sum())
+    solar_curtailed_mwh = float((sub["solar_curtailed_mw"] * w).sum())
+    curt_pct = (solar_curtailed_mwh / solar_potential_mwh * 100.0) if solar_potential_mwh > 0 else 0.0
+    lines.append(f"  Solar Curtailed: {solar_curtailed_mwh:,.1f} MWh ({curt_pct:.1f}% of potential)")
+
     ax1.text(
         0.01, 0.98, "\n".join(lines), transform=ax1.transAxes, va="top", ha="left",
         fontsize=7, bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.85),
@@ -607,7 +627,7 @@ def main():
         plot_generation_pie(gen, generation_pie_path)
         print(f"    保存: {generation_pie_path}")
 
-        print("\n[7] 季節別代表週(Weekly Seasonal Dispatch)グラフ(4枚)を作成中 ...")
+        print("\n[7] 季節別代表週(Weekly Seasonal Dispatch)グラフ(3枚)を作成中 ...")
         for i, (season_name, anchor_month, anchor_day) in enumerate(SEASON_ANCHORS, start=1):
             fname = f"{i:02d}_{season_name}.png"
             fpath = os.path.join(weekly_dir, fname)

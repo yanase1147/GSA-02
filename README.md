@@ -157,7 +157,7 @@ GSAとは別に、不確実性パラメータの**代表値（`lower_bound` と 
 関数をそのまま再利用しています（電源名は `solar` / `wind` / `battery` / `diesel` を想定）。
 
 ```bash
-python plot_annual_dispatch.py
+conda activate pypsa-pce-gsa
 python plot_annual_dispatch.py --config network_config.xlsx
 ```
 所要時間の目安は数十秒です（LP 1回のみ）。
